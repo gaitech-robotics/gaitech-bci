@@ -1,0 +1,282 @@
+#!/usr/bin/env python
+#####################################################################
+# Software License Agreement (BSD License)
+#
+#  Copyright (c) 2018, Gaitech Robotics
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#
+#   * Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#   * Redistributions in binary form must reproduce the above
+#     copyright notice, this list of conditions and the following
+#     disclaimer in the documentation and/or other materials provided
+#     with the distribution.
+#   * Neither the name of the Gaitech Robotics nor the names of its
+#     contributors may be used to endorse or promote products derived
+#     from this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+#  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+#  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+#  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+#  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+#  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+#  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+#  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+#  POSSIBILITY OF SUCH DAMAGE.
+#####################################################################
+"""
+H10C Live FrontEnd
+ROS Node
+"""
+import rospy, sys, os, shutil
+from PyQt4 import QtCore, QtGui
+import signal
+################### Subclasses Import ######################
+from gaitech_bci_tools.interface.H10CMainWindow import Ui_H10CMainWindow
+from gaitech_bci_tools import GaitechROSInterfaceNode, SaveEEGDataToBagFile, GaitechSettings, GaitechDataViewerWidget
+from gaitech_bci_tools import GaitechVideoExperimentBuilder, GaitechVideoExperimentPlayer
+from gaitech_bci_tools import GaitechAboutDialog, resource_dir
+
+
+############################################################
+##################### Main Window ##########################
+############################################################
+class GaitechH10CLiveMainWindow(QtGui.QMainWindow):
+    """
+    Gaitech Main Window for H10C Live Data
+    """
+    def __init__(self, parent=None):
+        super(GaitechH10CLiveMainWindow, self).__init__(parent)
+        self.ui = Ui_H10CMainWindow()
+        self.ui.setupUi(self)
+        self.expdir = None
+        self.video_experiments = []
+        self.video_experiment_playing = None
+        ## Add Gaitech Settings widget ##
+        self.ui.gridlayout_settings = QtGui.QGridLayout()
+        self.ui.settings = GaitechSettings(None)
+        self.ui.gridlayout_settings.addWidget(self.ui.settings, 0, 0, 1, 1)
+        self.ui.tabSettings.setLayout(self.ui.gridlayout_settings)
+        self.ui.gridlayout_live = QtGui.QGridLayout()
+        self.ui.livedata = GaitechDataViewerWidget(None, live=True)
+        self.ui.gridlayout_live.addWidget(self.ui.livedata, 0, 0, 1, 1)
+        self.ui.tabLive.setLayout(self.ui.gridlayout_live)
+        ### For Start ###
+        self.ui.livedata.sigDeviceStatus.emit('None')
+        self.ui.livedata.sigConnectionStatus.emit(3)
+        self.ui.livedata.sigConnectiviyStatus.emit(1.0, 0.0)
+        self._initialize_ui()
+        #### ROS Interface ###
+        self.rosinterface = GaitechROSInterfaceNode(self, self.ui.settings, self.ui.livedata)
+        ### Connect file menus ###
+        self.ui.actionE_xit.triggered.connect(self._on_exit)
+        self.ui.actionLicence.triggered.connect(self._on_mod_lic)
+        self.ui.action_About.triggered.connect(self._on_about)
+        self.ui.action_How_to.triggered.connect(self._on_show_help)
+        self.ui.tbStartVideo.clicked.connect(self._start_vid_exp)
+        self.ui.pbtnAddVideoExp.clicked.connect(self._add_vid_exp)
+        ### Connect Saving Feature ###
+        self.ui.livedata.sigSaveData.connect(SaveEEGDataToBagFile)
+        # Load the experiments #
+        self._load_experiments_in_expdir()
+
+    def _load_experiments_in_expdir(self):
+        """
+        Load experiments present in gaitech_bci_gui experiment directory
+        :return:
+        """
+        if self.expdir is not None and os.path.isdir(self.expdir):
+            # If directory exists load all *.experiment files
+            for _f in os.listdir(self.expdir):
+                _exppath = os.path.join(self.expdir, _f)
+                _expname = os.path.basename(_exppath)
+                _vidname, _expmarkers = GaitechVideoExperimentBuilder.xml2data(_exppath)
+                if _vidname is None and _expmarkers is None:
+                    # Some Error Occurred #
+                    continue
+                if _vidname is None:
+                    continue
+                # Means Experiment is legit #
+                self.video_experiments.append((_expname, _exppath))
+        # Display all experiments to the list #
+        self._update_videxpui()
+
+    def _update_videxpui(self):
+        """
+        Update the ui to show experiments
+        :return:
+        """
+        if len(self.video_experiments) > 0:
+            self.ui.tbStartVideo.setEnabled(True)
+            _mdl = QtGui.QStandardItemModel(self.ui.lvidexp)
+            for _exp in self.video_experiments:
+                _itm = QtGui.QStandardItem(_exp[0])
+                _mdl.appendRow(_itm)
+            self.ui.lvidexp.setModel(_mdl)
+        else:
+            self.ui.tbStartVideo.setEnabled(False)
+            _mdl = QtGui.QStandardItemModel(self.ui.lvidexp)
+            self.ui.lvidexp.setModel(_mdl)
+
+    # Start experiments etc #
+    def _start_vid_exp(self):
+        """
+        Start Video Experiment
+        :return:
+        """
+        _sel = self.ui.lvidexp.selectedIndexes()
+        if len(_sel) == 0:
+            QtGui.QMessageBox.information(self, 'Select Experiment', "Select an experiment to play first")
+            return
+        _sel = _sel[0].row()
+        if (_sel >= 0) and _sel < len(self.video_experiments):
+            if self.video_experiment_playing is not None:
+                self.video_experiment_playing.close()
+                self.video_experiment_playing = None
+            ### Only start if connected ####
+            if self.ui.settings.getConnectionStatus() != 1:
+                QtGui.QMessageBox.critical(self, 'Device not connected', "Make sure device is"
+                                                                         " connected before starting")
+                return
+            self.video_experiment_playing = GaitechVideoExperimentPlayer(self.video_experiments[_sel][1])
+            if not self.video_experiment_playing.initokay:
+                QtGui.QMessageBox.critical(self, 'Error Initializing', "Experiment could not be initialized")
+                self.video_experiment_playing = None
+                return
+            # Connect callbacks for experiment #
+            self.video_experiment_playing.sigExperimentStarted.connect(self._exp_vid_started)
+            self.video_experiment_playing.sigExperimentDone.connect(self._exp_vid_finished)
+            self.video_experiment_playing.sigExperimentMarker.connect(self._exp_vid_event)
+            self.video_experiment_playing.sigExperimentCancelled.connect(self._exp_close)
+            self.video_experiment_playing.sigExperimentDone.connect(self._exp_close)
+            # Start Streaming if it is off #
+            self.ui.livedata.sigStream.emit(True)
+            # Start the experiment #
+            self.video_experiment_playing.startExperiment()
+            self.video_experiment_playing.show()
+
+    def _add_vid_exp(self):
+        """
+        Add video experiment and copy it to experiments directory
+        :return:
+        """
+        dlg = QtGui.QFileDialog()
+        dlg.setFileMode(QtGui.QFileDialog.ExistingFile)
+        dlg.setFilter("BCI Experiment (*.experiment)")
+        if dlg.exec_():
+            _fname = unicode(dlg.selectedFiles()[0])
+            # Open Experiment File #
+            _vname, _markers = GaitechVideoExperimentBuilder.xml2data(_fname)
+            if _vname is None and _markers is None:
+                # Some Error Occurred #
+                QtGui.QMessageBox.critical(self, 'Error Parsing Experiment', "There are errors in file %s" % _fname)
+                return
+            if _vname is None:
+                QtGui.QMessageBox.critical(self, 'Missing Video Name', "Experiment is missing video name")
+                return
+            _exp = os.path.basename(_fname)
+            self.video_experiments.append((_exp, _fname))
+            self._update_videxpui()
+
+    def _on_exit(self):
+        """
+        Close the gui and node
+        :return:
+        """
+        self.close()
+
+    def _on_mod_lic(self):
+        """
+        Modify licence callback
+        :return:
+        """
+        self.ui.settings.lkey_dialog()
+
+    def _on_show_help(self):
+        """
+        Show help callback
+        :return:
+        """
+        rospy.loginfo('Consult project git for help')
+
+    def _on_about(self):
+        """
+        Show About Gaitech
+        :return:
+        """
+        dlg = GaitechAboutDialog()
+        dlg.exec_()
+
+    ###### Experiment UI Related Stuff ######
+    def _exp_close(self):
+        """
+        Call to cleanup expermient related stuff
+        :return:
+        """
+        self.video_experiment_playing.deleteLater()
+        self.video_experiment_playing = None
+        self.rosinterface.uieventmsg(('uiclosed_01', 'UI Closed', 'Video Experiment UI Closed'))
+        rospy.loginfo("Video Experiment UI Closed")
+
+    def _exp_vid_event(self, _data):
+        """
+        Pass on video events to experiment recorder
+        :param _data:
+        :return:
+        """
+        self.rosinterface.uieventmsg(_data)
+
+    def _exp_vid_started(self):
+        """
+        Callback to video experiment started
+        :return:
+        """
+        rospy.loginfo("Video Experiment Started")
+
+    def _exp_vid_finished(self):
+        """
+        Callback to video experiment finished
+        :return:
+        """
+        rospy.loginfo("Video Experiment Finished")
+
+    # Initialize UI ##
+    def _initialize_ui(self):
+        """
+        Initialize UI ( Load resources etc )
+        :return:
+        """
+        try:
+            self.ui.pbtnAddVideoExp.setIcon(QtGui.QIcon(os.path.join(resource_dir,
+                                                                     'if_icon-58-document-upload_314515.png')))
+        except:
+            print 'Debugging : Main UI Unable to load open icon'
+        try:
+            self.ui.tbStartVideo.setIcon(QtGui.QIcon(os.path.join(resource_dir, 'if_video_279.png')))
+        except:
+            print 'Debugging : Main UI Unable to load video icon'
+        try:
+            self.setWindowIcon(QtGui.QIcon(os.path.join(resource_dir, 'gaitech_logo.png')))
+        except:
+            print 'Debugging: Unable to load gaitech icon'
+
+
+if __name__ == '__main__':
+    try:
+        rospy.init_node('view_bci_data')
+        rospy.loginfo('Starting view_bci_data')
+        app = QtGui.QApplication(sys.argv)
+        gui = GaitechH10CLiveMainWindow()
+        gui.show()
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        sys.exit(app.exec_())
+    except rospy.ROSInterruptException:
+        pass

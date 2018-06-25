@@ -1,0 +1,7 @@
+# Service Message to update filter settings
+# REQUEST
+float64 lowpass
+float64 highpass
+float64 notchlow
+float64 notchhigh
+---

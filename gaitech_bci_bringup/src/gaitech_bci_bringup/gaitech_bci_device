@@ -1,0 +1,589 @@
+#!/usr/bin/env python
+#####################################################################
+# Software License Agreement (BSD License)
+#
+#  Copyright (c) 2018, Gaitech Robotics
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#
+#   * Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#   * Redistributions in binary form must reproduce the above
+#     copyright notice, this list of conditions and the following
+#     disclaimer in the documentation and/or other materials provided
+#     with the distribution.
+#   * Neither the name of the Gaitech Robotics nor the names of its
+#     contributors may be used to endorse or promote products derived
+#     from this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+#  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+#  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+#  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+#  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+#  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+#  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+#  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+#  POSSIBILITY OF SUCH DAMAGE.
+#####################################################################
+"""
+H10C Device Backend
+ROS Node
+"""
+############## Python Modules Import ########################
+import sys, os, rospy
+from threading import Thread
+try:
+    import numpy as np
+except ImportError as e:
+    print 'Please install numpy'
+    sys.exit(-1)
+try:
+    from avertuseegheadset.AvertusEEGHeadset import AvertusEEGHeadset as AvertusH10CHeadset
+except ImportError as e:
+    print 'Please install python-avertuseegheadset, which can be obtained from Gaitech'
+    sys.exit(-1)
+############# Import messages and services #################
+from std_srvs.srv import Empty, EmptyResponse
+from std_msgs.msg import Header
+from gaitech_bci_bringup.msg import AverageReference, CommonReference, DeviceInfo
+from gaitech_bci_bringup.msg import LongitudinalBipolar, TransverseBipolar
+from gaitech_bci_bringup.srv import *
+
+
+############################################################
+################### ROS Device Class #######################
+############################################################
+class GaitechH10CROSNode():
+    """
+    ROS Node Class for H10C Device
+    """
+    def __init__(self):
+        ############## Data Members ##########
+        self.datapacketseqno = 0
+        self.packetspersec = 0
+        self.quality = {'Fp1': 0.0, 'Fp2': 0.0, 'F7': 0.0, 'F8': 0.0, 'T3': 0.0, 'T4': 0.0,
+                        'T5': 0.0, 'T6': 0.0, 'O1': 0.0, 'O2': 0.0}
+        self.bufferMemory = np.zeros((500, 10))
+        self.counterMemory = 0
+        self.syncpacketnumber = -2
+        self.synctime = None
+        self.inittime = None
+        self.filter = None
+        self.filter_low = GaitechH10CROSNode.get_param('~filter_low', 100.0)
+        self.filter_high = GaitechH10CROSNode.get_param('~filter_high', 5.0)
+        self.filter_notch_low = GaitechH10CROSNode.get_param('~filter_notch_low', 45.0)
+        self.filter_notch_high = GaitechH10CROSNode.get_param('~filter_notch_high', 55.0)
+        self.device_name = GaitechH10CROSNode.get_param('~device')
+        self.should_connect = GaitechH10CROSNode.get_param('~start_connected')
+        if self.should_connect is None:
+            self.should_connect = False
+        #######################################
+        self.adapter = str(GaitechH10CROSNode.get_param('~adapter', 'None'))
+        ######## Create device object after we get adapter name ifany #########
+        try:
+            if self.adapter == 'None':
+                rospy.loginfo('Will use default bluetooth adapter')
+                self.device = AvertusH10CHeadset('/etc/gaitech/avertuseegheadset/licfile.key')
+            else:
+                rospy.loginfo('Will use bluetooth adapter with address %s', self.adapter)
+                self.device = AvertusH10CHeadset('/etc/gaitech/avertuseegheadset/licfile.key', self.adapter)
+            self.device.debugmsg = self._logmsg         # Register debug message callback
+            self.device.datacallback = self._datarecv   # Register data callback
+        except RuntimeError as e:
+            rospy.logerr('[Could not create device object][%s]', e)
+            sys.exit(-1)
+        ##########################
+        ###### Register Publishers #####
+        self.pubCommon = rospy.Publisher('~data_comref', CommonReference, queue_size=10)
+        rospy.loginfo('Will publish %s on topic %s', self.pubCommon.type, self.pubCommon.name)
+        self.pubAverage = rospy.Publisher('~data_avgref', AverageReference, queue_size=10)
+        rospy.loginfo('Will publish %s on topic %s', self.pubAverage.type, self.pubAverage.name)
+        self.pubLB = rospy.Publisher('~data_lb', LongitudinalBipolar, queue_size=10)
+        rospy.loginfo('Will publish %s on topic %s', self.pubLB.type, self.pubLB.name)
+        self.pubTB = rospy.Publisher('~data_tb', TransverseBipolar, queue_size=10)
+        rospy.loginfo('Will publish %s on topic %s', self.pubTB.type, self.pubTB.name)
+        self.pubStatus = rospy.Publisher('~info', DeviceInfo, queue_size=2)
+        rospy.loginfo('Will publish %s on topic %s', self.pubStatus.type, self.pubStatus.name)
+        ###### Register Services #######
+        self.srvScan = rospy.Service('~scan', DeviceScan, self._doscan)
+        self.srvConn = rospy.Service('~connect', DeviceConnect, self._doconnect)
+        self.srvDsCn = rospy.Service('~disconnect', Empty, self._dodisconnect)
+        self.srvStatus = rospy.Service('~get_status', DeviceStatus, self._givestatus)
+        self.srvFltUpd = rospy.Service('~set_filter', FilterUpdate, self._setfilter)
+        self.srvFltGet = rospy.Service('~get_filter', FilterInfo, self._getfilter)
+        self.srvLicUpd = rospy.Service('~set_licence', LicenceUpdate, self._setlicence)
+        self.srvLicGet = rospy.Service('~get_licence', LicenceInfo, self._getlicence)
+        rospy.loginfo('All services registered')
+        ######### Initialize Fitler Once #########
+        self._initializefilter()
+        ####### Connect if device name passed from parameter server and should_connect is True ######
+        if self.device_name is not None and self.should_connect:
+            _req = DeviceConnectRequest()
+            _req.device = self.device_name
+            self._doconnect(_req)       # Manually call service call back function
+
+    def statusUpdate(self):
+        """
+        Update Status when connected at 1 Hz, invoked on thread or is blocking callback
+        :return: None
+        """
+        def _intializeinfomsg(_seqnum):
+            _msgstatus = DeviceInfo()
+            _msgstatus.header = Header()
+            _msgstatus.header.seq = _seqnum
+            _msgstatus.header.stamp = rospy.Time.now()
+            _msgstatus.device_name = ''
+            _msgstatus.device_connected = False
+            _msgstatus.uptime = 0.0
+            _msgstatus.loss = 0.0
+            _msgstatus.fp1 = 0
+            _msgstatus.fp2 = 0
+            _msgstatus.f7 = 0
+            _msgstatus.f8 = 0
+            _msgstatus.t3 = 0
+            _msgstatus.t4 = 0
+            _msgstatus.t5 = 0
+            _msgstatus.t6 = 0
+            _msgstatus.o1 = 0
+            _msgstatus.o2 = 0
+            return _msgstatus
+
+        rospy.loginfo('Starting status update')
+        r = rospy.Rate(1)  # Run at 1 Hz
+        _stsseq = 0
+        while not rospy.is_shutdown():
+            _msgstatus = _intializeinfomsg(_stsseq)
+            if self.device_name is not None:
+                _msgstatus.device_name = self.device_name
+                _msgstatus.device_connected = self.device.isConnected()
+                if self.device.isConnected():
+                    # Simple formula to calculate loss #
+                    _losspercent = float(1000 - self.packetspersec) / float(1000)   # Total 1000 packets per second
+                    if _losspercent < 0.0: # We are getting more packets
+                        _losspercent = 0.0
+                    _msgstatus.loss = _losspercent
+                    # Reset loss calculations for next seconds #
+                    self.packetspersec = 0
+                    if self.inittime is not None:
+                        _tmup = rospy.Time.now() - self.inittime
+                        _msgstatus.uptime = _tmup.to_sec()
+                        _msgstatus.fp1 = self.quality['Fp1']
+                        _msgstatus.fp2 = self.quality['Fp2']
+                        _msgstatus.f7 = self.quality['F7']
+                        _msgstatus.f8 = self.quality['F8']
+                        _msgstatus.t3 = self.quality['T3']
+                        _msgstatus.t4 = self.quality['T4']
+                        _msgstatus.t5 = self.quality['T5']
+                        _msgstatus.t6 = self.quality['T6']
+                        _msgstatus.o1 = self.quality['O1']
+                        _msgstatus.o2 = self.quality['O2']
+                else:
+                    self.packetspersec = 0
+            #################################
+            self.pubStatus.publish(_msgstatus)
+            _stsseq += 1
+            try:
+                r.sleep()
+            except rospy.exceptions.ROSTimeMovedBackwardsException:
+                pass
+        rospy.loginfo('Exiting status update')
+
+    def _initializefilter(self):
+        """
+        Intialize filter
+        :return:
+        """
+        from scipy.signal import butter, lfilter_zi
+        if self.filter_high > 0 and self.filter_low > 0:  # Bandpass
+            bf, af = butter(3, np.array([self.filter_high, self.filter_low]) / 500.0, 'bandpass')
+        elif self.filter_high > 0:  # Highpass
+            bf, af = butter(3, self.filter_high / 500.0, 'highpass')
+        elif self.filter_low > 0:  # Lowpass
+            bf, af = butter(3, self.filter_low / 500.0, 'lowpass')
+        else:
+            bf = 1
+            af = 1
+        ## Notch Filter ##
+        if (self.filter_notch_low > self.filter_high) and (self.filter_notch_high < self.filter_low):
+            _notchmid = (self.filter_notch_low + self.filter_notch_high) / 2.0
+            _notchdiff = self.filter_notch_high - _notchmid
+            _filterfreqs = []
+            _ifilterfreq = 1.0
+            while True:
+                if (_notchmid * _ifilterfreq) > 260:
+                    break
+                _filterfreqs.append(_notchmid * _ifilterfreq)
+                _ifilterfreq += 2.0
+            for notch_freq in _filterfreqs:
+                bn, an = butter(3, np.array([notch_freq - _notchdiff, notch_freq + _notchdiff]) / 500.0, 'bandstop')
+                bf = np.convolve(bf, bn)
+                af = np.convolve(af, an)
+        zi = lfilter_zi(bf, af)
+        zi = np.tile(zi, (10, 1)).transpose()
+        memorySize = max(len(af), len(bf)) + 50
+        memoryFilt = np.ones((memorySize, 10))
+        self.filter = {'af': af, 'bf': bf, 'zi': zi, 'mem': memoryFilt}
+
+    def _impedanceestimate(self, signalinput):
+        """
+        Calculate impedance estimate
+        :param signalinput: filtered input signal
+        :return:
+        """
+        worstVariance = 1200
+        bestVariance = 160
+        signalOff = 10
+        diffFactor = 1.2
+        # UNBIASED VARIANCE
+        varValue = np.zeros((len(signalinput[0])))
+        for i in range(0, len(signalinput[0])):
+            chanSignal = ([x[i] for x in signalinput])
+            numSamples = len(chanSignal)
+            varValue[i] = np.var(chanSignal) * 1.0 * numSamples / (numSamples - 1)  # switch to unbiased (*n/(n-1))
+            if varValue[i] < signalOff:
+                varValue[i] = worstVariance + 100
+        # QUALITY MEASUREMENT REGRESSION
+        worstVar = np.power(worstVariance, diffFactor)
+        bestVar = np.power(bestVariance, diffFactor)
+        varValFactored = np.power(varValue, diffFactor)
+        impQuality = 100.0 * (worstVar - varValFactored) / (worstVar - bestVar)
+        impQuality[impQuality > 100.0] = 100.0
+        impQuality[impQuality < 0.0] = 0.0
+
+        return impQuality
+
+    def _clearfilter(self):
+        """
+        Clear memory in filter
+        :return:
+        """
+        if self.filter is not None:
+            memorySize = max(len(self.filter['af']), len(self.filter['bf'])) + 50
+            memoryFilt = np.ones((memorySize, 10))
+            self.filter['mem'] = memoryFilt
+
+    def _applyfilter(self, filtIn):
+        """
+        Apply filter
+        :param filtIn: 1 sample of data
+        :return:
+        """
+        # Input is the signal, apply filter zivals get updated every time
+        from scipy.signal import lfilter
+        if self.filter is None:
+            return filtIn
+        self.filter['mem'] = np.concatenate((self.filter['mem'][1:], [filtIn]), axis=0)     # Forget old and add new
+        # Apply Filter #
+        output, zfVal = lfilter(self.filter['bf'], self.filter['af'], self.filter['mem'],
+                                axis=0, zi=self.filter['zi'])
+        # Store Results #
+        self.filter['zi'] = zfVal
+        _outsample = output[-1]
+        # Calculate impedence #
+        self.bufferMemory[self.counterMemory] = _outsample
+        self.counterMemory = self.counterMemory + 1
+        if self.counterMemory >= 500:
+            impedanceQEst = self._impedanceestimate(self.bufferMemory)
+            self.quality['Fp1'] = impedanceQEst[0]
+            self.quality['Fp2'] = impedanceQEst[1]
+            self.quality['F7'] = impedanceQEst[2]
+            self.quality['F8'] = impedanceQEst[3]
+            self.quality['T3'] = impedanceQEst[4]
+            self.quality['T4'] = impedanceQEst[5]
+            self.quality['T5'] = impedanceQEst[6]
+            self.quality['T6'] = impedanceQEst[7]
+            self.quality['O1'] = impedanceQEst[8]
+            self.quality['O2'] = impedanceQEst[9]
+            self.counterMemory = 0
+        _outsample = [_val * 1e-6 for _val in _outsample]  # Convert to voltage
+        return _outsample
+
+    def _doscan(self, req):
+        """
+        Service Callback, Perform Scan
+        :return: DeviceScanResponse
+        """
+        resp = DeviceScanResponse()
+        _licdev = self.device.listLicencedAvertusDevices()
+        for _btdev in _licdev:
+            resp.devices.append(str(_btdev[0]))
+            resp.validity.append(_btdev[1])
+        return resp
+
+    def _doconnect(self, req):
+        """
+        Service Callback, Connect to device
+        :return: DeviceConnectResponse
+        """
+        res = DeviceConnectResponse()
+        _dname = req.device
+        self._dodisconnect(None)    # Perform disconnection if already connected
+        self.quality = {'Fp1': 0.0, 'Fp2': 0.0, 'F7': 0.0, 'F8': 0.0, 'T3': 0.0, 'T4': 0.0,
+                        'T5': 0.0, 'T6': 0.0, 'O1': 0.0, 'O2': 0.0} # Reset Quality
+        res.connected = self.device.connect(_dname)
+        if res.connected:
+            self.inittime = rospy.Time.now()
+            self.synctime = None
+            self.syncpacketnumber = -1  # From now on receive Data
+            rospy.loginfo('Connected to %s' % _dname)
+        else:
+            rospy.logwarn('Could not connect to %s' % _dname)
+        self.device_name = _dname
+        GaitechH10CROSNode.set_param('device', self.device_name)
+        return res
+
+    def _dodisconnect(self, req):
+        """
+        Service Callback, Disconnect
+        :return: EmptyResponse
+        """
+        if self.device.isConnected():
+            self.syncpacketnumber = -2  # From now on ignore incoming data
+            self.device.disconnect()
+            self._clearfilter()
+            self.packetspersec = 0
+            self.inittime = None
+            self.synctime = None
+            rospy.loginfo('Disconnected device')
+        return EmptyResponse()
+
+    def _givestatus(self, req):
+        """
+        Service Callback, return current status
+        :return: DeviceStatusResponse
+        """
+        res = DeviceStatusResponse()
+        if self.device_name is None:
+            res.device = ''
+            res.connected = False
+        else:
+            res.device = self.device_name
+            res.connected = self.device.isConnected()
+        return res
+
+    def _setfilter(self, req):
+        """
+        Service Callback, Set filter
+        :return: FilterUpdateResponse
+        """
+        # TODO VERIFY
+        self.filter_low = req.lowpass
+        self.filter_high = req.highpass
+        self.filter_notch_low = req.notchlow
+        self.filter_notch_high = req.notchhigh
+        self._initializefilter()
+        GaitechH10CROSNode.set_param('filter_low', self.filter_low)
+        GaitechH10CROSNode.set_param('filter_high', self.filter_high)
+        GaitechH10CROSNode.set_param('filter_notch_low', self.filter_notch_low)
+        GaitechH10CROSNode.set_param('filter_notch_high', self.filter_notch_high)
+        rospy.loginfo('Filters Updated : [%f,%f] %f:%f', self.filter_low, self.filter_high,
+                      self.filter_notch_low, self.filter_notch_high)
+        return FilterUpdateResponse()
+
+    def _getfilter(self, req):
+        """
+        Service Callback, Get filter
+        :return: FilterInfoResponse
+        """
+        res = FilterInfoResponse()
+        res.lowpass = self.filter_low
+        res.highpass = self.filter_high
+        res.notchlow = self.filter_notch_low
+        res.notchhigh = self.filter_notch_high
+        return res
+
+    def _setlicence(self, req):
+        """
+        Service Callback, Set Licence
+        :return: LicenceUpdateResponse
+        """
+        self.device.updateLicenceKeys(req.licences)
+        rospy.loginfo('Licences Updated')
+        return LicenceUpdateResponse()
+
+    def _getlicence(self, req):
+        """
+        Service Callback, Get Licence
+        :return: LicenceInfoResponse
+        """
+        res = LicenceInfoResponse()
+        _lkeys = self.device.getLicenceKeys()
+        for _key in _lkeys:
+            res.licences.append(str(_key))
+        return res
+
+    def _publishsample(self, _sample, _time):
+        """
+        Publish data as ros message
+        :param _sample: Data to publish
+        :return:
+        """
+        if _sample is not None:
+            _hdr = Header()
+            _hdr.seq = self.datapacketseqno
+            _hdr.stamp = _time
+            self.datapacketseqno += 1
+            # Publish filtered Data #
+            if self.pubCommon.get_num_connections() > 0:
+                _msg = CommonReference()
+                _msg.header = _hdr
+                _msg.fp1 = _sample[0]
+                _msg.fp2 = _sample[1]
+                _msg.f7 = _sample[2]
+                _msg.f8 = _sample[3]
+                _msg.t3 = _sample[4]
+                _msg.t4 = _sample[5]
+                _msg.t5 = _sample[6]
+                _msg.t6 = _sample[7]
+                _msg.o1 = _sample[8]
+                _msg.o2 = _sample[9]
+                self.pubCommon.publish(_msg)
+            if self.pubAverage.get_num_connections() > 0:
+                _msg = AverageReference()
+                _msg.header = _hdr
+                _avg = sum(_sample) / 10.0
+                _msg.fp1_avg = _sample[0] - _avg
+                _msg.fp2_avg = _sample[1] - _avg
+                _msg.f7_avg = _sample[2] - _avg
+                _msg.f8_avg = _sample[3] - _avg
+                _msg.t3_avg = _sample[4] - _avg
+                _msg.t4_avg = _sample[5] - _avg
+                _msg.t5_avg = _sample[6] - _avg
+                _msg.t6_avg = _sample[7] - _avg
+                _msg.o1_avg = _sample[8] - _avg
+                _msg.o2_avg = _sample[9] - _avg
+                self.pubAverage.publish(_msg)
+            if self.pubTB.get_num_connections() > 0:
+                _msg = TransverseBipolar()
+                _msg.header = _hdr
+                _msg.fp1_fp2 = _sample[0] - _sample[1]
+                _msg.f7_f8 = _sample[2] - _sample[3]
+                _msg.t3_t4 = _sample[4] - _sample[5]
+                _msg.t5_t6 = _sample[6] - _sample[7]
+                _msg.o1_o2 = _sample[8] - _sample[9]
+                self.pubTB.publish(_msg)
+            if self.pubLB.get_num_connections() > 0:
+                _msg = LongitudinalBipolar()
+                _msg.header = _hdr
+                _msg.fp1_fp7 = _sample[0] - _sample[2]
+                _msg.f7_t3 = _sample[2] - _sample[4]
+                _msg.t3_t5 = _sample[4] - _sample[6]
+                _msg.t5_o1 = _sample[6] - _sample[8]
+                _msg.fp2_f8 = _sample[1] - _sample[3]
+                _msg.f8_t4 = _sample[3] - _sample[5]
+                _msg.t4_t6 = _sample[5] - _sample[7]
+                _msg.t6_o2 = _sample[7] - _sample[9]
+                self.pubLB.publish(_msg)
+
+    def _datarecv(self, pno, tm, data):
+        """
+        Callback to AvertusH10CHeadset object's data stream
+        :param pno: Packet number of data
+        :param tm: Time at which hardware of this computer received data
+        :param data: Data packet as a list of 10 numbers, sequence is [Fp1, Fp2, F7, F8, T3, T4, T5, T6, O1, O2]
+        :return:
+        """
+        if self.syncpacketnumber == -2:     # Ignore Old messages
+            return
+        if self.syncpacketnumber == -1:
+            # Initial Data Packet
+            self.syncpacketnumber = pno
+            self.inittime = rospy.Time.now()
+            self.synctime = rospy.Time.now()
+            rospy.loginfo('Started receiving data')
+        _duration = rospy.Duration((pno - self.syncpacketnumber)*0.001)
+        if _duration.to_sec() < 0.0:
+            # Packet number reset #
+            self.synctime = rospy.Time.now()
+            self.syncpacketnumber = pno
+            _duration = rospy.Duration(0)
+            rospy.logwarn('Detected packet number reset, re-syncing')
+        _sampletime = self.synctime + _duration
+        _timecheck = abs((rospy.Time.now()-_sampletime).to_sec())
+        if _timecheck > 1.0:
+            # Resync #
+            self.synctime = rospy.Time.now()
+            self.syncpacketnumber = pno
+            _sampletime = self.synctime
+            rospy.logwarn('Data lag detected, re-syncing')
+        # For Loss Calculations #
+        self.packetspersec += 1
+        rospy.logdebug('Got data packet number %d', pno)    # Comment it later
+        try:
+            # Apply Filter #
+            _sample = self._applyfilter(data)
+            # Publish Message #
+            self._publishsample(_sample, _sampletime)
+        except ValueError as e:
+            rospy.logwarn('Value error : %s', e)
+        except TypeError as e:
+            rospy.logwarn('Type error : %s', e)
+        except ArithmeticError as e:
+            rospy.logwarn('Arithmetic error : %s', e)
+        except:
+            e = sys.exc_info()[0]
+            rospy.logwarn('A Generic error occurred while processing data : %s', e)
+
+    def _logmsg(self, msg):
+        """
+        Callback to AvertusH10CHeadset object's debug messages
+        :param msg:
+        :return:
+        """
+        rospy.loginfo('[AvertusH10CHeadset] %s', msg)
+
+    def destroyobject(self):
+        """
+        Cleanup object
+        :return:
+        """
+        self.device.destroy()
+
+    @staticmethod
+    def get_param(name, value=None):
+        """
+        Get setting from parameter server
+        :param name: name of key in parameter server
+        :param value:
+        :return:
+        """
+        private = "~%s" % name
+        if rospy.has_param(private):
+            return rospy.get_param(private)
+        elif rospy.has_param(name):
+            return rospy.get_param(name)
+        else:
+            return value
+
+    @staticmethod
+    def set_param(name, value=''):
+        """
+        Set Value in parameter server
+        :param name:
+        :param value:
+        :return:
+        """
+        private = "~%s" % name
+        if rospy.has_param(name):
+            rospy.set_param(name, value)
+        else:
+            rospy.set_param(private, value)
+
+
+if __name__ == '__main__':
+    try:
+        rospy.init_node('gaitech_bci_device')
+        rospy.loginfo('Starting gaitech_bci_device node')
+        rn = GaitechH10CROSNode()
+        rn.statusUpdate() # Main Blocking Function
+        rn.destroyobject()
+        rospy.loginfo('Exiting Program')
+    except rospy.ROSInterruptException as ex:
+        print 'Exception Occurred : %s' % str(ex)

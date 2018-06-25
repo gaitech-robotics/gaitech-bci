@@ -1,0 +1,247 @@
+#!/usr/bin/env python
+#####################################################################
+# Software License Agreement (BSD License)
+#
+#  Copyright (c) 2018, Gaitech Robotics
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#
+#   * Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#   * Redistributions in binary form must reproduce the above
+#     copyright notice, this list of conditions and the following
+#     disclaimer in the documentation and/or other materials provided
+#     with the distribution.
+#   * Neither the name of the Gaitech Robotics nor the names of its
+#     contributors may be used to endorse or promote products derived
+#     from this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+#  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+#  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+#  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+#  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+#  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+#  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+#  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+#  POSSIBILITY OF SUCH DAMAGE.
+#####################################################################
+
+"""
+    Make Experiment from CSV File
+"""
+import sys, os, csv, cv2, datetime
+import numpy as np
+from optparse import OptionParser
+from xml.dom import minidom
+
+
+def _convert2xml(_exp, _vidname):
+    _doc = minidom.Document()
+    _root = _doc.createElement('BCIExperiment')
+    _doc.appendChild(_doc.createComment('Auto-generated using Gaitech Video Experiment CSV Converter on %s' %
+                                        str(datetime.datetime.now())))
+    _exptype = _doc.createElement('type')
+    _exptype.appendChild(_doc.createTextNode('video'))
+    _root.appendChild(_exptype)
+    _videonode = _doc.createElement('video')
+    _totalframes = int(_exp['fno'][-1] + _exp['disptime'][-1] + _exp['fps'])
+    _totaltime = float(_totalframes) / _exp['fps']
+    _videonode.setAttribute('path', unicode(_vidname))
+    _videonode.setAttribute('time', str(_totaltime))
+    _videonode.setAttribute('frames', str(_totalframes))
+    ## Add all markers ##
+    for _i in range(len(_exp['time'])):
+        _marker = _doc.createElement('marker')
+        _tm = _doc.createElement('time')
+        _tm.appendChild(_doc.createTextNode(str(_exp['time'][_i])))
+        _ev = _doc.createElement('event')
+        _ev.appendChild(_doc.createTextNode(str(_exp['event'][_i])))
+        _rm = _doc.createElement('remark')
+        _rm.appendChild(_doc.createTextNode(str(_exp['remark'][_i])))
+        _marker.appendChild(_tm)
+        _marker.appendChild(_ev)
+        _marker.appendChild(_rm)
+        _videonode.appendChild(_marker)
+        # Marker for end display #
+        _tend = float(_exp['disptime'][_i] + _exp['fno'][_i]) / _exp['fps']
+        _marker = _doc.createElement('marker')
+        _tm = _doc.createElement('time')
+        _tm.appendChild(_doc.createTextNode(str(_tend)))
+        _ev = _doc.createElement('event')
+        _ev.appendChild(_doc.createTextNode(str('%s_END' % _exp['event'][_i])))
+        _rm = _doc.createElement('remark')
+        _rm.appendChild(_doc.createTextNode(str('%s (display turned off)' % _exp['remark'][_i])))
+        _marker.appendChild(_tm)
+        _marker.appendChild(_ev)
+        _marker.appendChild(_rm)
+        _videonode.appendChild(_marker)
+    #####################
+    _root.appendChild(_videonode)
+    _doc.appendChild(_root)
+    return _doc
+
+
+def _splittxt_multilines(_text, fsiz=2.0, fwid=3):
+    _txt = _text.split()
+    _lines = []
+    _st = 0
+    _ed = 1
+    while True:
+        _ln = ' '.join(_txt[_st:_ed])
+        txtsize, _ = cv2.getTextSize(_ln, cv2.FONT_HERSHEY_COMPLEX, fsiz, fwid)
+        _wid = txtsize[0]
+        if _wid < 850:
+            if _ed >= len(_txt):
+                if _ln != '':
+                    _lines.append(_ln)
+                break
+            _ed += 1
+            continue
+        else:
+            _lines.append(_ln)
+            _st = _ed
+            _ed = _st + 1
+    return _lines
+
+
+def _make_frame(_text):
+    fsize = 3.0
+    fwid = 4
+    _frame = np.zeros((720, 1280, 3), dtype='uint8')
+    _splittxt = _splittxt_multilines(_text, fsize, fwid)
+    nlines = len(_splittxt)
+    if nlines > 5:
+        # If text exceeds 5 lines show only first 5 lines
+        nlines = 5
+    for _i in range(nlines):
+        tsize, spacing = cv2.getTextSize(_splittxt[_i], cv2.FONT_HERSHEY_COMPLEX, fsize, fwid)
+        _ht = (_i * tsize[1]) + (_i-1)*spacing
+        _tht = (nlines * tsize[1]) + (nlines-1)*spacing
+        _ht = 360 - (_tht/2) + _ht
+        _wd = 640 - tsize[0]/2
+        cv2.putText(_frame, _splittxt[_i], (_wd, _ht), cv2.FONT_HERSHEY_COMPLEX, fsize, (240, 240, 240), fwid)
+    return _frame
+
+
+def _make_avi(_exp, _vidname, fps):
+    def check_frame(_fno):
+        for _j in reversed(range(len(_exp['fno']))):
+            if (_fno >= _exp['fno'][_j]) and _fno < (_exp['fno'][_j]+_exp['disptime'][_j]):
+                return _j
+        return -1
+
+    fourcc = cv2.VideoWriter_fourcc('H', '2', '6', '4')
+    _totalframes = int(_exp['fno'][-1] + _exp['disptime'][-1] + fps)
+    vid = cv2.VideoWriter(_vidname, fps=fps, frameSize=(1280, 720), isColor=True, fourcc=fourcc)
+    _blackframe = np.zeros((720, 1280, 3), dtype='uint8')
+    print 'Start Writing Video File %s' % _vidname
+    for _i in range(_totalframes):
+        _fno = _i+1
+        _sts = check_frame(_fno)
+        if _sts == -1:
+            # Write Black Frame
+            vid.write(_blackframe)
+        else:
+            # Write Text on Frame
+            _frame = _make_frame(_exp['remark'][_sts])
+            vid.write(_frame)
+    vid.release()
+    print 'Video compiled'
+
+
+def _sort_exp(_exp):
+    _outexp = {'time': [x for _, x in sorted(zip(_exp['fno'], _exp['time']))],
+               'event': [x for _, x in sorted(zip(_exp['fno'], _exp['event']))],
+               'remark': [x for _, x in sorted(zip(_exp['fno'], _exp['remark']))],
+               'disptime': [x for _, x in sorted(zip(_exp['fno'], _exp['disptime']))],
+               'fno': sorted(_exp['fno']), 'fps': _exp['fps']}
+    return _outexp
+
+
+def _check_file_writable(fnm):
+    if os.path.exists(fnm):
+        # path exists
+        if os.path.isfile(fnm): # Check if it is a file
+            # also works when file is a link and the target is writable
+            return os.access(fnm, os.W_OK)
+        else:
+            return False # path is a dir, so cannot write as a file
+    pdir = os.path.dirname(fnm) # Check file directory
+    if not pdir:
+        pdir = '.'
+    return os.access(pdir, os.W_OK)
+
+
+def _parseargs():
+    parser = OptionParser()
+    parser.add_option("-i", "--input", dest="input", help="input *.csv file", metavar="FILE")
+    parser.add_option("-o", "--output", dest="output", help="output *.experiment file", metavar="FILE")
+    (options, args) = parser.parse_args()
+    if options.input is None:
+        print 'No Input file specified'
+        parser.print_help()
+        sys.exit(-1)
+    if options.output is None:
+        print 'No Output file specified'
+        parser.print_help()
+        sys.exit(-1)
+    if not os.path.isfile(options.input):
+        print 'Can not open %s' % str(options.input)
+        sys.exit(-1)
+    if not _check_file_writable(options.output):
+        print 'Can not write output file to %s' % str(options.output)
+        sys.exit(-1)
+    return options.input, options.output
+
+
+if __name__ == '__main__':
+    fps = 30.0  # Video Frames per second
+    _ifile, _ofile = _parseargs()
+    _Exp = {'time': [], 'event': [], 'remark': [], 'disptime': [], 'fno': [], 'fps': fps}
+    # Read CSV File
+    with open(_ifile, 'r') as csvfile:
+        reader = csv.reader(csvfile)
+        for row in reader:
+            if len(row) == 4:
+                try:
+                    _tm = float(row[1])
+                    _tmd = float(row[3])
+                    _evt = row[0]
+                    _rmk = row[2]
+                    ####### Okay Till here ########
+                    _stfno = int(_tm * fps)
+                    _sttime = float(_stfno) / fps
+                    _dfms = int(_tmd * fps)
+                    _Exp['time'].append(_sttime)
+                    _Exp['disptime'].append(_dfms)
+                    _Exp['fno'].append(_stfno)
+                    _Exp['event'].append(_evt)
+                    _Exp['remark'].append(_rmk)
+                except ValueError as e:
+                    continue
+    _Exp = _sort_exp(_Exp)
+    if len(_Exp['time']) > 0:
+        ########### Output file componenets ###########
+        _ofiledir = os.path.dirname(os.path.abspath(_ofile))
+        _ofilebasename = os.path.basename(_ofile).split('.')
+        if len(_ofilebasename) > 1:
+            _ofilebasename = '.'.join(_ofilebasename[:-1])
+        else:
+            _ofilebasename = _ofilebasename[0]
+        _ofileexp = '%s.experiment'%_ofilebasename
+        _ofilevid = '%s.avi'%_ofilebasename
+        print 'Loaded Experiment from CSV File'
+        #### Make AVI File with experiment ######
+        _make_avi(_Exp, os.path.join(_ofiledir, _ofilevid), fps)
+        #### Save Experiment ####
+        _doc = _convert2xml(_Exp, os.path.join(_ofiledir, _ofilevid))
+        with open(os.path.join(_ofiledir, _ofileexp), 'w') as _f:
+            _doc.writexml(_f, indent="  ", addindent="  ", newl='\n')
+        print 'Generated Experiment File : %s' % _ofileexp

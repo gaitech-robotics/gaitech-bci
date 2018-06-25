@@ -1,0 +1,15 @@
+Header header 
+string device_name
+bool device_connected
+float64 uptime
+float64 loss
+uint8 fp1
+uint8 fp2
+uint8 f7
+uint8 f8
+uint8 t3
+uint8 t4
+uint8 t5
+uint8 t6
+uint8 o1
+uint8 o2

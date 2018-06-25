@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<launch>
+	<!-- Launch file to start gaitech_bci_device node that publishes data on ros and handles device communication -->
+	<arg name="nodeid" default="1" />					<!-- Number to uniquely identify this node -->
+	<arg name="adapter" default="None" /> <!-- You can pass bluetooth adress of any adapter on your computer -->
+	<arg name="filter_high" default="5.0" />		<!-- High pass filter value -->
+	<arg name="filter_low" default="100.0" />		<!-- Low pass filter value -->
+	<arg name="filter_notch_low" default="45.0" />	<!-- Lower value of Notch Filter, to disable notch filter set it higher than filter_low -->
+	<arg name="filter_notch_high" default="55.0" />	<!-- Upper value of Notch Filter, must be higher than filter_notch_low --> 
+	<arg name="device" default="None" />			<!-- Name of device to connect to -->
+	<arg name="start_connected" default="false" />	<!-- Set to true only if you want to try connect with device at startup -->
+	<arg name="logoutput" default="screen" />		<!-- Set to log if you dont want to show messages to screen -->
+	<node name="gaitech_bci_device_$(arg nodeid)" pkg="gaitech_bci_bringup" type="gaitech_bci_device" output="$(arg logoutput)">
+		<param name="adapter" type="string" value="$(arg adapter)" />
+		<param name="filter_high" value="$(arg filter_high)" type="double" />
+		<param name="filter_low" value="$(arg filter_low)" type="double"  />
+		<param name="filter_notch_low" value="$(arg filter_notch_low)" type="double"  />
+		<param name="filter_notch_high" value="$(arg filter_notch_high)" type="double" />
+		<param name="device" value="$(arg device)" type="string" />
+		<param name="start_connected" value="$(arg start_connected)" type="bool" />
+	</node>
+</launch>

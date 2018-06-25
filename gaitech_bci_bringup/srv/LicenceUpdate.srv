@@ -1,0 +1,5 @@
+# Service Message to update stored licences
+# REQUEST
+string[] licences
+---
+

@@ -1,0 +1,310 @@
+#!/usr/bin/env python
+#####################################################################
+# Software License Agreement (BSD License)
+#
+#  Copyright (c) 2018, Gaitech Robotics
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#
+#   * Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#   * Redistributions in binary form must reproduce the above
+#     copyright notice, this list of conditions and the following
+#     disclaimer in the documentation and/or other materials provided
+#     with the distribution.
+#   * Neither the name of the Gaitech Robotics nor the names of its
+#     contributors may be used to endorse or promote products derived
+#     from this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+#  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+#  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+#  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+#  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+#  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+#  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+#  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+#  POSSIBILITY OF SUCH DAMAGE.
+#####################################################################
+"""
+H10C Live FrontEnd
+ROS Node
+"""
+import rospy, sys, time
+import numpy as np
+import matplotlib.pyplot as plt
+from threading import Thread
+from scipy.signal import detrend
+from gaitech_bci_bringup.msg import AverageReference, CommonReference, LongitudinalBipolar, TransverseBipolar
+
+
+###################################################
+######### Class Calculate and View PSD ############
+###################################################
+class GaitechViewPSD():
+    """
+    Calculate PSD and View it
+    """
+    def __init__(self):
+        self.type = get_param("~montage", 0)
+        self.showsnr = get_param("~snr", False)
+        if self.type == 0:
+            self.subscriber = rospy.Subscriber('bci_data', CommonReference, self._cmn_msg)
+            rospy.loginfo('Subscribed to Common Reference Data on %s', self.subscriber.resolved_name)
+            self.channels = 10
+            self.ch_names = ['Fp1', 'Fp2', 'F7', 'F8', 'T3', 'T4', 'T5', 'T6', 'O1', 'O2']
+        elif self.type == 1:
+            self.subscriber = rospy.Subscriber('bci_data', AverageReference, self._avg_msg)
+            rospy.loginfo('Subscribed to Average Reference Data on %s', self.subscriber.resolved_name)
+            self.channels = 10
+            self.ch_names = ['Fp1-Avg', 'Fp2-Avg', 'F7-Avg', 'F8-Avg', 'T3-Avg', 'T4-Avg', 'T5-Avg',
+                             'T6-Avg', 'O1-Avg', 'O2-Avg']
+        elif self.type == 2:
+            self.subscriber = rospy.Subscriber('bci_data', LongitudinalBipolar, self._lb_msg)
+            rospy.loginfo('Subscribed to Longitudinal Bipolar Data on %s', self.subscriber.resolved_name)
+            self.channels = 8
+            self.ch_names = ['Fp1-F7', 'F7-T3', 'T3-T5', 'T5-O1', 'Fp2-F8', 'F8-T4', 'T4-T6', 'T6-O2']
+        elif self.type == 3:
+            self.subscriber = rospy.Subscriber('bci_data', TransverseBipolar, self._tb_msg)
+            rospy.loginfo('Subscribed to Transverse Bipolar Data on %s', self.subscriber.resolved_name)
+            self.channels = 5
+            self.ch_names = ['Fp1-Fp2', 'F7-F8', 'T3-T4', 'T5-T6', 'O1-O2']
+        else:
+            rospy.logerr('Unknown montage type')
+            sys.exit(-1)
+        ###### Initailize other stuff #####
+        self.bufferMemory = np.zeros((1000, self.channels))
+        self.psdDispCounter = 0
+        self.psdSample = np.zeros((self.channels, 263))
+        self.started = False
+        self.thread = None
+        self.scale = 100
+        self.times = np.arange(263)
+        self.fig, self.axes = plt.subplots(1, 1, sharex=True)
+        # Plot Lines #
+        lines = []
+        for ii in range(self.channels):
+            line, = self.axes.plot(self.times, self.psdSample[ii, ::1] - ii, lw=1)
+            lines.append(line)
+        self.lines = lines
+        self.axes.set_ylim(-self.channels + 1.0, 1.0)
+        self.fig.canvas.mpl_connect('key_press_event', self.OnKeypress)
+        self.fig.canvas.mpl_connect('button_press_event', self.onclick)
+        if self.showsnr:
+            self.fig.canvas.set_window_title('SNR_View')
+        else:
+            self.fig.canvas.set_window_title('PSD View')
+        ticks = np.arange(0, -self.channels, -1)
+        self.axes.set_xlabel('Frequency (Hz)')
+        self.axes.xaxis.grid(False)
+        self.axes.set_yticks(ticks)
+        ticks_labels = ['%s' % (self.ch_names[ii]) for ii in range(self.channels)]
+        self.axes.set_yticklabels(ticks_labels)
+
+    ####### Subscriber Callbacks ##########
+
+    def _cmn_msg(self, msg):
+        """
+        Callback to Commong msg
+        :param msg:
+        :return:
+        """
+        if type(msg) != CommonReference:
+            rospy.logerr('%s is not Common Reference message', rospy.Subscriber.resolved_name)
+            sys.exit(-1)
+        _sample_time = msg.header.stamp
+        _sample = [msg.fp1, msg.fp2, msg.f7, msg.f8, msg.t3, msg.t4, msg.t5, msg.t6, msg.o1, msg.o2]
+        self._process_sample(_sample, _sample_time)
+
+    def _avg_msg(self, msg):
+        """
+        Callback to Average msg
+        :param msg:
+        :return:
+        """
+        if type(msg) != AverageReference:
+            rospy.logerr('%s is not Average Reference message', rospy.Subscriber.resolved_name)
+            sys.exit(-1)
+        _sample_time = msg.header.stamp
+        _sample = [msg.fp1_avg, msg.fp2_avg, msg.f7_avg, msg.f8_avg, msg.t3_avg, msg.t4_avg, msg.t5_avg,
+                   msg.t6_avg, msg.o1_avg, msg.o2_avg]
+        self._process_sample(_sample, _sample_time)
+
+    def _lb_msg(self, msg):
+        """
+        Callback to LB msg
+        :param msg:
+        :return:
+        """
+        if type(msg) != LongitudinalBipolar:
+            rospy.logerr('%s is not Longitudinal Bipolar message', rospy.Subscriber.resolved_name)
+            sys.exit(-1)
+        _sample_time = msg.header.stamp
+        _sample = [msg.fp1_fp7, msg.f7_t3, msg.t3_t5, msg.t5_o1, msg.fp2_f8, msg.f8_t4, msg.t4_t6, msg.t6_o2]
+        self._process_sample(_sample, _sample_time)
+
+    def _tb_msg(self, msg):
+        """
+        Callback to TB msg
+        :param msg:
+        :return:
+        """
+        if type(msg) != TransverseBipolar:
+            rospy.logerr('%s is not Transverse Bipolar message', rospy.Subscriber.resolved_name)
+            sys.exit(-1)
+        _sample_time = msg.header.stamp
+        _sample = [msg.fp1_fp2, msg.f7_f8, msg.t3_t4, msg.t5_t6, msg.o1_o2]
+        self._process_sample(_sample, _sample_time)
+
+    def _process_sample(self, _sample, _time):
+        """
+        Process sample
+        :param _sample:
+        :return:
+        """
+        # Convert to uV #
+        _smapleuv = [_a*1000000.0 for _a in _sample]
+        # Process ##
+        self.bufferMemory = np.concatenate((self.bufferMemory[1:], [_smapleuv]), axis=0)
+        self.psdDispCounter = self.psdDispCounter + 1
+        if self.psdDispCounter >= 100:
+            if self.showsnr:
+                self.psdSample = self.calculateSNR2D(self.bufferMemory, self.channels)
+            else:
+                self.psdSample = self.calculatePSD2D(self.bufferMemory, self.channels)
+            self.psdDispCounter = 0
+
+    ########################################
+
+    def calculateSNR(self, Pxx):
+        num_neighbor = 1
+        snr = []
+        for i in range(len(Pxx)):
+            left = Pxx[:i][-num_neighbor:]
+            right = Pxx[i + 1:num_neighbor + i + 1]
+            sig = left.tolist()
+            sig.append(Pxx[i])
+            sig.extend(right.tolist())
+            sig = np.array(sig).mean()
+            leftn = Pxx[:i-num_neighbor][-3*num_neighbor:]
+            rightn = Pxx[i + 1 + num_neighbor:3*num_neighbor + i + 1 +num_neighbor]
+            noise = leftn.tolist()
+            noise.extend(rightn.tolist())
+            noise = np.array(noise).mean()
+            snr.append(sig / noise)
+        return  np.array(snr)
+
+    def calculateSNR2D(self, signalInput, numberOfChan):
+        # signalInput contains the last 1000ms streaming data of multiple channels.
+        # Integrated with calculatePSD function for the PSD calculation itself.
+        # Returns 2D output (number of channels X 263 PSD array for each channel).
+        psd2Doutput = np.zeros((numberOfChan, 263))
+        for i in range(0, numberOfChan):
+            psd2Doutput[i] = self.calculatePSD([x[i] for x in signalInput])
+            psd2Doutput[i] = self.calculateSNR(psd2Doutput[i])
+        return psd2Doutput
+
+    def calculatePSD(self, signalInput):
+        # signalInput contains the last 1000ms one-channel streaming data.
+        # Returns a PSD array (size: 263) with resolution of 1 Hz, starting from 0 up to 262 Hz.
+        # The index of the output shall indicate the frequency (e.g. PSD[12]: 12 Hz)
+        resolution = 1.0
+        NFFT = int(1000 / resolution)
+
+        if len(signalInput) < 1000:  # Not enough data, returns a 0
+            psdOutput = 0
+            return psdOutput
+        else:
+            signalInput = signalInput[-1000:]  # Takes only the last 1000ms of data
+            signalDemeaned = signalInput - np.mean(signalInput)
+            signalDetrend = detrend(signalDemeaned)
+            w = np.hamming(1000)
+            signalHam = (signalDetrend * w)
+            fftOutput = np.fft.fft(signalHam, n=NFFT)
+            fftMagnitude = np.abs(fftOutput)
+            psdOutput = fftMagnitude[0:263]  # Range of PSD limited up to 262 Hz due to the headset hardware limitation
+            psdOutput = 2 * psdOutput
+            return psdOutput
+
+    def calculatePSD2D(self, signalInput, numberOfChan):
+        # signalInput contains the last 1000ms streaming data of multiple channels.
+        # Integrated with calculatePSD function for the PSD calculation itself.
+        # Returns 2D output (number of channels X 263 PSD array for each channel).
+        psd2Doutput = np.zeros((numberOfChan, 263))
+        for i in range(0, numberOfChan):
+            psd2Doutput[i] = self.calculatePSD([x[i] for x in signalInput])
+        return psd2Doutput
+
+    ## UI Functionality ##
+
+    def update_plot(self):
+        """
+        Update Plot
+        :return:
+        """
+        while self.started:
+            for ii in range(self.channels):
+                self.lines[ii].set_xdata(self.times)
+                self.lines[ii].set_ydata(self.psdSample[ii, ::1] / self.scale - ii)
+            ticks_labels = ['%s' % (self.ch_names[ii]) for ii in range(self.channels)]
+            self.axes.set_yticklabels(ticks_labels)
+            self.fig.canvas.draw()
+            time.sleep(0.05)
+
+    def onclick(self, event):
+        """
+        Show on click
+        :param event:
+        :return:
+        """
+        print(event.button, event.x, event.y, event.xdata, event.ydata)
+
+    def OnKeypress(self, event):
+        """
+        On Key Press Event
+        :param event:
+        :return:
+        """
+        if event.key == '/':
+            self.scale *= 1.2
+        elif event.key == '*':
+            self.scale /= 1.2
+
+    def start(self):
+        self.started = True
+        self.thread = Thread(target=self.update_plot)
+        self.thread.daemon = True
+        self.thread.start()
+        plt.show()
+
+    def stop(self):
+        self.started = False
+
+
+def get_param(name, value=None):
+    private = "~%s" % name
+    if rospy.has_param(private):
+        print 'has param'
+        return rospy.get_param(private)
+    elif rospy.has_param(name):
+        return rospy.get_param(name)
+    else:
+        return value
+
+
+if __name__ == '__main__':
+    try:
+        rospy.init_node('view_psd')
+        rospy.loginfo('Starting view_psd')
+        rsd = GaitechViewPSD()
+        rsd.start()
+        rospy.loginfo('Exiting ...')
+        rsd.stop()
+    except rospy.ROSInterruptException:
+        pass

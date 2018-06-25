@@ -1,0 +1,170 @@
+#!/usr/bin/env python
+#####################################################################
+# Software License Agreement (BSD License)
+#
+#  Copyright (c) 2018, Gaitech Robotics
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#
+#   * Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#   * Redistributions in binary form must reproduce the above
+#     copyright notice, this list of conditions and the following
+#     disclaimer in the documentation and/or other materials provided
+#     with the distribution.
+#   * Neither the name of the Gaitech Robotics nor the names of its
+#     contributors may be used to endorse or promote products derived
+#     from this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+#  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+#  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+#  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+#  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+#  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+#  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+#  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+#  POSSIBILITY OF SUCH DAMAGE.
+#####################################################################
+
+"""
+Convert Data from rosbag file to *.csv file
+"""
+import sys, os, mne
+import numpy as np
+from optparse import OptionParser
+from gaitech_bci_tools import LoadEEGDataFromBagFile
+
+
+def _check_file_writable(fnm):
+    if os.path.exists(fnm):
+        # path exists
+        if os.path.isfile(fnm): # Check if it is a file
+            # also works when file is a link and the target is writable
+            return os.access(fnm, os.W_OK)
+        else:
+            return False # path is a dir, so cannot write as a file
+    pdir = os.path.dirname(fnm) # Check file directory
+    if not pdir:
+        pdir = '.'
+    return os.access(pdir, os.W_OK)
+
+
+def _parseargs():
+    parser = OptionParser()
+    parser.add_option("-i", "--input", dest="input", help="input *.rosbag file", metavar="FILE")
+    parser.add_option("-o", "--output", dest="output", help="output *.fif file", metavar="FILE")
+    parser.add_option("-e", "--epoch", dest="epoch", help="Save processed epochs", default=False, action="store_true")
+    parser.add_option("-s", "--show", dest="show", help="Show plots", default=False, action="store_true")
+    (options, args) = parser.parse_args()
+    if options.input is None:
+        print 'No Input file specified'
+        parser.print_help()
+        sys.exit(-1)
+    if options.output is None:
+        print 'No Output file specified'
+        parser.print_help()
+        sys.exit(-1)
+    if not os.path.isfile(options.input):
+        print 'Can not open %s' % str(options.input)
+        sys.exit(-1)
+    if not _check_file_writable(options.output):
+        print 'Can not write output file to %s' % str(options.output)
+        sys.exit(-1)
+    return options.input, options.output, options.epoch, options.show
+
+
+def _tm2ind(_time, _start):
+    _idx = int((_time-_start)*1000)
+    return _idx
+
+
+def _evntid(_evnt, _evntlist):
+    for _i in range(len(_evntlist)):
+        if _evnt == _evntlist[_i]:
+            return _i
+    return -1
+
+
+if __name__ == '__main__':
+    _ifile, _ofile, _saveepochs, _show = _parseargs()
+    _Data = LoadEEGDataFromBagFile(None, _ifile)
+    if _Data['mode'] == 'Common Reference':
+        sfreq = 1000
+        ch_types = ['eeg', 'eeg', 'eeg', 'eeg', 'eeg', 'eeg', 'eeg', 'eeg', 'eeg', 'eeg', 'stim']
+        ch_names = ['Fp1', 'Fp2', 'F7', 'F8', 'T3', 'T4', 'T5', 'T6', 'O1', 'O2', 'event']
+        info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
+        # Create Data Array #
+        _Events = []
+        _totaltime = _Data['time'][-1] - _Data['time'][0]
+        _starttime = _Data['time'][0]
+        _totalpackets = int(_totaltime * 1000)+1
+        _data = np.zeros((11, _totalpackets), dtype='float64')
+        for _i in range(len(_Data['time'])):
+            _idx = _tm2ind(_Data['time'][_i], _starttime)
+            _data[0][_idx] = _Data['data']['Fp1'][_i]
+            _data[1][_idx] = _Data['data']['Fp2'][_i]
+            _data[2][_idx] = _Data['data']['F7'][_i]
+            _data[3][_idx] = _Data['data']['F8'][_i]
+            _data[4][_idx] = _Data['data']['T3'][_i]
+            _data[5][_idx] = _Data['data']['T4'][_i]
+            _data[6][_idx] = _Data['data']['T5'][_i]
+            _data[7][_idx] = _Data['data']['T6'][_i]
+            _data[8][_idx] = _Data['data']['O1'][_i]
+            _data[9][_idx] = _Data['data']['O2'][_i]
+        for _mrk in _Data['markers']:
+            _idx = _tm2ind(_mrk[1], _starttime)
+            if _evntid(_mrk[2], _Events) == -1:
+                _Events.append(_mrk[2])
+            _eno = _evntid(_mrk[2], _Events) + 1
+            _data[10][_idx] = _eno
+        if len(_Events) > 0:
+            print 'User Events remapped to'
+        for _i in range(len(_Events)):
+            print '%s :: %d' % (_Events[_i], _i+1)
+        ##### Data Raw Done ######
+        mnt = mne.channels.read_montage('standard_1020', ch_names)
+        raw = mne.io.RawArray(_data, info)
+        raw.set_montage(mnt)
+        if not _saveepochs:
+            _fname = _ofile.split('.')
+            if len(_fname) > 1:
+                _fname = ''.join(_fname[:-1])
+            else:
+                _fname = _fname[0]
+            _fname = '%s_raw.fif' % _fname
+            print 'Saving raw data to file %s' % _fname
+            raw.save(_fname, tmin=_starttime, tmax=_Data['time'][-1], overwrite=True)
+            if _show:
+                raw.plot(show=True, block=True)
+        else:
+            print 'Epoching Raw Data'
+            events = mne.find_events(raw)
+            event_id = {}
+            for _i in range(len(_Events)):
+                event_id[_Events[_i]] = _i+1
+            print 'Stimuli used for epoching'
+            print event_id
+            tmin, tmax = -0.3, 0.7
+            picks = mne.pick_types(raw.info, meg=False, eog=False, eeg=True)
+            baseline = (None, 0.0)
+            epochs = mne.Epochs(raw, events=events, event_id=event_id, tmin=tmin, tmax=tmax,
+                                baseline=baseline, reject=None, picks=picks)
+            _fname = _ofile.split('.')
+            if len(_fname) > 1:
+                _fname = ''.join(_fname[:-1])
+            else:
+                _fname = _fname[0]
+            _fname = '%s-epo.fif' % _fname
+            print 'Saving epoched data to file %s' % _fname
+            epochs.save(_fname)
+            if _show:
+                epochs.plot(block=True)
+    else:
+        print 'Can not find valid raw data in bag file, mode in file was : %s' % _Data['mode']

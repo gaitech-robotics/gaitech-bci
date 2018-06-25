@@ -1,0 +1,151 @@
+#!/usr/bin/env python
+#####################################################################
+# Software License Agreement (BSD License)
+#
+#  Copyright (c) 2018, Gaitech Robotics
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#
+#   * Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#   * Redistributions in binary form must reproduce the above
+#     copyright notice, this list of conditions and the following
+#     disclaimer in the documentation and/or other materials provided
+#     with the distribution.
+#   * Neither the name of the Gaitech Robotics nor the names of its
+#     contributors may be used to endorse or promote products derived
+#     from this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+#  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+#  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+#  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+#  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+#  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+#  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+#  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+#  POSSIBILITY OF SUCH DAMAGE.
+#####################################################################
+"""
+Convert Data from rosbag file to *.csv file
+"""
+import rospy, sys, os, csv
+from optparse import OptionParser
+from bisect import bisect_left
+from gaitech_bci_tools import LoadEEGDataFromBagFile
+
+
+def _find_nearest_time_in_data(_data, tsearch):
+    """
+    Searches to find nearest valid value of time in data
+    :param tsearch: time to search
+    :return: (actual_value, idx)
+    """
+    if 'time' not in _data:
+        return 0.0, -1
+    _pos = bisect_left(_data['time'], tsearch)
+    if _pos == 0:
+        return _data['time'][0], 0
+    if _pos == len(_data['time']):
+        return _data['time'][-1], len(_data['time']) - 1
+    _before = _data['time'][_pos - 1]
+    _after = _data['time'][_pos]
+    if (_after - tsearch) < (tsearch - _before):
+        return _after, _pos
+    else:
+        return _before, _pos - 1
+
+
+def _check_file_writable(fnm):
+    if os.path.exists(fnm):
+        # path exists
+        if os.path.isfile(fnm): # Check if it is a file
+            # also works when file is a link and the target is writable
+            return os.access(fnm, os.W_OK)
+        else:
+            return False # path is a dir, so cannot write as a file
+    pdir = os.path.dirname(fnm) # Check file directory
+    if not pdir: pdir = '.'
+    return os.access(pdir, os.W_OK)
+
+
+def _parseargs():
+    parser = OptionParser()
+    parser.add_option("-i", "--input", dest="input", help="input *.rosbag file", metavar="FILE")
+    parser.add_option("-o", "--output", dest="output", help="output *.csv file", metavar="FILE")
+    (options, args) = parser.parse_args()
+    if options.input is None:
+        print 'No Input file specified'
+        parser.print_help()
+        sys.exit(-1)
+    if options.output is None:
+        print 'No Output file specified'
+        parser.print_help()
+        sys.exit(-1)
+    if not os.path.isfile(options.input):
+        print 'Can not open %s' % str(options.input)
+        sys.exit(-1)
+    if not _check_file_writable(options.output):
+        print 'Can not write output file to %s' % str(options.output)
+        sys.exit(-1)
+    return options.input, options.output
+
+
+def _strwithescape(_txt):
+    return _txt.replace('\n', '\\n').replace('\r', '\\r').replace('\t',' \\t').replace(',', '.')
+
+
+if __name__ == '__main__':
+    _ifile, _ofile = _parseargs()
+    _Data = LoadEEGDataFromBagFile(None, _ifile)
+    if _Data['mode'] != '':
+        # Convert Data to writeable format #
+        _header = ['time']
+        for _k in _Data['data']:
+            _header.append(_k)
+        _header.extend(['marker', 'event', 'remark'])
+        _DATA = {}
+        for _k in _header:
+            _DATA[_k] = []
+        for _i in range(len(_Data['time'])):
+            _DATA['time'].append(_Data['time'][_i])
+            for _k in _Data['data']:
+                _DATA[_k].append(_Data['data'][_k][_i])
+            _DATA['marker'].append('')
+            _DATA['event'].append('')
+            _DATA['remark'].append('')
+        ## Now Add Markers ##
+        for _mrk in _Data['markers']:
+            _tm, _pos = _find_nearest_time_in_data(_Data, _mrk[1])
+            if _pos >= len(_Data['time']):
+                _DATA['time'].append(_mrk[1])
+                for _k in _Data['data']:
+                    _DATA[_k].append(0.0)
+                _DATA['marker'].append(_strwithescape(_mrk[0]))
+                _DATA['event'].append(_strwithescape(_mrk[2]))
+                _DATA['remark'].append(_strwithescape(_mrk[3]))
+            else:
+                _DATA['marker'][_pos] = _strwithescape(_mrk[0])
+                _DATA['event'][_pos] = _strwithescape(_mrk[2])
+                _DATA['remark'][_pos] = _strwithescape(_mrk[3])
+        ## Now Save to file ##
+        _ROW = dict()
+        for _r in _header:
+            _ROW[_r] = None
+        print 'Writing CSV File'
+        with open(_ofile, 'w') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=_header)
+            writer.writeheader()
+            for _i in range(len(_DATA['time'])):
+                for _r in _header:
+                    _ROW[_r] = _DATA[_r][_i]
+                writer.writerow(_ROW)
+        print 'Wrote to %s' % _ofile
+    else:
+        print 'Can not find valid data in bag file'

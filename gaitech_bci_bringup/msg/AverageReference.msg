@@ -1,0 +1,11 @@
+Header header
+float64 fp1_avg
+float64 fp2_avg
+float64 f7_avg
+float64 f8_avg
+float64 t3_avg
+float64 t4_avg
+float64 t5_avg
+float64 t6_avg
+float64 o1_avg
+float64 o2_avg

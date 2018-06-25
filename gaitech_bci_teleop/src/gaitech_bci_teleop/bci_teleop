@@ -1,0 +1,853 @@
+#!/usr/bin/env python
+#####################################################################
+# Software License Agreement (BSD License)
+#
+#  Copyright (c) 2018, Gaitech Robotics
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#
+#   * Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#   * Redistributions in binary form must reproduce the above
+#     copyright notice, this list of conditions and the following
+#     disclaimer in the documentation and/or other materials provided
+#     with the distribution.
+#   * Neither the name of the Gaitech Robotics nor the names of its
+#     contributors may be used to endorse or promote products derived
+#     from this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+#  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+#  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+#  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+#  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+#  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+#  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+#  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+#  POSSIBILITY OF SUCH DAMAGE.
+#####################################################################
+
+"""
+Robot Teleop BCI
+ROS Node
+"""
+import rospy, rosnode, rostopic, sys, os, cv2
+from PyQt4 import QtCore, QtGui
+import signal as pysignal
+import numpy as np
+from threading import Thread
+import scipy
+from scipy import signal
+
+from gaitech_bci_tools import FlickeringImageWidget, ImageLeft, ImageRight, ImageUp, ImageDown, ImageStop
+from gaitech_bci_teleop.interface.H10CRobotTeleop import Ui_H10CRobotTeleop
+from gaitech_bci_tools import GaitechSettings, GaitechROSInterfaceNode, GaitechAboutDialog, resource_dir
+
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge, CvBridgeError
+
+
+############################################################
+##################### Main Window ##########################
+############################################################
+class GaitechBCITeleopMainWindow(QtGui.QMainWindow):
+    """
+    Gaitech Main Window for Robot Teleop
+    """
+    _sigImageReceived = QtCore.pyqtSignal(np.ndarray)
+
+    def __init__(self,  parent=None):
+        super(GaitechBCITeleopMainWindow, self).__init__(parent)
+        self.ui = Ui_H10CRobotTeleop()
+        self.ui.setupUi(self)
+        ## Add Gaitech Settings widget ##
+        self.ui.gridlayout_settings = QtGui.QGridLayout()
+        self.ui.settings = GaitechSettings(None)
+        self.ui.gridlayout_settings.addWidget(self.ui.settings, 0, 0, 1, 1)
+        self.ui.tabH10CSettings.setLayout(self.ui.gridlayout_settings)
+        self.scene = QtGui.QGraphicsScene(None)
+        self.statusBar().showMessage('Command Velocities are disabled')
+        #### ROS Interface ###
+        self.rosinterface = GaitechROSInterfaceNode(self, self.ui.settings, None)
+        self.rosinterface.callbackdata = self.datacallback
+        ## Data Members ##
+        self.activecveltopic = None
+        self.allcveltopics = []
+        self.__updatingcveltopics = False
+        self.cvelpub = None
+        self.activecamtopic = None
+        self.allcamtopics = []
+        self.allcamtopicstype = []
+        self.camsub = None
+        self.__updatingcamtopics = False
+        self.imgdisplayed = None
+        self.bridge = CvBridge()
+        self.operaterobot = False
+        ### For computing user input ###
+        self.bufferMemory = None  # for 2 sec
+        self.currentmode = None
+        self.psdDispCounter = 0
+        self.recentFreqs = []
+        self.detfreq = {'det': [0, 0, 0, 0], 'freq': [5.0, 5.0, 5.0, 5.0]}  # Up Left Right Down
+        self.vel2send = (0.0, 0.0, rospy.Time.now())
+        ## Parameters ##
+        self.velforward = self.get_param('~vel_forward', 0.5)
+        self.velrotation = self.get_param('~vel_rotation', 0.5)
+        self.velbackward = self.get_param('~vel_backward', 0.0)
+        rospy.loginfo('Forward Velocity : %f m/s, Rotation : %f radian/sec, Backward : %f m/s',
+                      self.velforward, self.velrotation, self.velbackward)
+        self.buffertime = self.get_param('~det_window', 2.0)
+        self.checktime = self.get_param('~det_interval', 1.0)
+        self.freqdetspread = self.get_param('~freq_tolerance', 0.9)
+        self.recentfreqcount = self.get_param('~freq_recent', 5)
+        self.freqdetcount = self.get_param('~freq_detect', 3)
+        self.snrneighbors = self.get_param('~snr_neighbors', 2)
+        rospy.loginfo('Algorithm will run on window of %f secs with interval of %f secs',
+                      self.buffertime, self.checktime)
+        rospy.loginfo('Parameters are : Frequency Tolerance : %f, Neighbors : %s [%s:%s]', self.freqdetspread,
+                      str(self.snrneighbors), str(self.freqdetcount), str(self.recentfreqcount))
+        ## Initialize UI ##
+        self._initialize_ui()
+        self._connectcallbacks()
+        self._flickerinit()
+        self._onereloadcvel()
+        self._onreloadcam()
+
+    ## UI Callbacks ##
+    def _on_exit(self):
+        """
+        Close the gui and node
+        :return:
+        """
+        self.closethreads()
+        self.close()
+
+    def _on_show_help(self):
+        """
+        Show help callback
+        :return:
+        """
+        rospy.loginfo('Consult project git for help')
+
+    def _on_about(self):
+        """
+        Show About Gaitech
+        :return:
+        """
+        _dlg = GaitechAboutDialog()
+        _dlg.exec_()
+
+    ## Main Loop Non UI ##
+
+    def loop(self):
+        """
+        Main Loop to publish etc
+        :return:
+        """
+        hz = self.get_param('rate', 10.0)
+        r = rospy.Rate(hz)
+        while not rospy.is_shutdown():
+            if not self.isVisible():
+                rospy.loginfo('Exiting Gaitech BCI Teleop, since GUI is closed')
+                break
+            ### Publish CVels if possible ###
+            if self.operaterobot:
+                if (rospy.Time.now() - self.vel2send[2]).to_sec() < 2.0:
+                    self.pubvel(self.vel2send[0], self.vel2send[1])
+                else:
+                    self.pubvel(0.0, 0.0)
+            #################################
+            try:
+                r.sleep()
+            except rospy.exceptions.ROSTimeMovedBackwardsException:
+                pass
+
+    def pubvel(self, lin, ang):
+        """
+        Publish Command Velocity
+        :param lin:
+        :param ang:
+        :return:
+        """
+        msg = Twist()
+        msg.linear.x = lin
+        msg.linear.y = 0.0
+        msg.linear.z = 0.0
+        msg.angular.z = ang
+        msg.angular.y = 0.0
+        msg.angular.x = 0.0
+        if self.cvelpub is not None:
+            self.cvelpub.publish(msg)
+
+    def datacallback(self, data):
+        """
+        Process Data
+        :param data:
+        :return:
+        """
+        _initmode = False
+        if self.currentmode is None:
+            self.currentmode = data['mode']
+            _initmode = True
+        if _initmode or self.currentmode != data['mode']:
+            # mode has changed reset stuff
+            self.bufferMemory = None  # for 2 sec
+            self.psdDispCounter = 0
+            self.recentFreqs = []
+            self.currentmode = data['mode']
+            if data['mode'] == 'Common Reference':
+                self.bufferMemory = np.zeros((int(self.buffertime * 1000.0), 2))
+            elif data['mode'] == 'Average Reference':
+                self.bufferMemory = np.zeros((int(self.buffertime * 1000.0), 2))
+            elif data['mode'] == 'Longitudinal-Bipolar':
+                self.bufferMemory = np.zeros((int(self.buffertime * 1000.0), 2))
+            elif data['mode'] == 'Transverse-Bipolar':
+                self.bufferMemory = np.zeros((int(self.buffertime * 1000.0), 1))
+            else:
+                rospy.logwarn('Unknown type of data : %s', data['mode'])
+        ####### Only If buuferMemory is not None #####
+        if self.bufferMemory is not None:
+            _smapleuv = [_a * 1000000.0 for _a in data['data']]
+            if data['mode'] == 'Common Reference':
+                _smapleuv = [_smapleuv[8], _smapleuv[9]]
+            elif data['mode'] == 'Average Reference':
+                _smapleuv = [_smapleuv[8], _smapleuv[9]]
+            elif data['mode'] == 'Longitudinal-Bipolar':
+                _smapleuv = [_smapleuv[3], _smapleuv[7]]
+            elif data['mode'] == 'Transverse-Bipolar':
+                _smapleuv = [_smapleuv[4]]
+            self.bufferMemory = np.concatenate((self.bufferMemory[1:], [_smapleuv]), axis=0)
+            self.psdDispCounter += 1
+            ### Process after some time ####
+            if self.psdDispCounter >= int(self.checktime*1000.0):
+                self.psdDispCounter = 0
+                self._calculatesnr()
+                self._makedecisions()
+
+    def _calculatesnr(self):
+        """
+        Compute SNR For Data
+        :param Pxx:
+        :return:
+        """
+        fs = 1000
+        x = np.sum(self.bufferMemory, 1)
+        f, _Pxx = signal.welch(x, fs, 'flattop', nperseg=1000, scaling='spectrum')
+
+        def compsnr(f, Pxx):
+            snr = []
+            for i in range(len(Pxx)):
+                left = Pxx[:i][-self.snrneighbors:]
+                right = Pxx[i + 1:self.snrneighbors + i + 1]
+                sig = left.tolist()
+                sig.append(Pxx[i])
+                sig.extend(right.tolist())
+                sig = np.array(sig).mean()
+                leftn = Pxx[:i - self.snrneighbors][-3 * self.snrneighbors:]
+                rightn = Pxx[i + 1 + self.snrneighbors:3 * self.snrneighbors + i + 1 + self.snrneighbors]
+                noise = leftn.tolist()
+                noise.extend(rightn.tolist())
+                noise = np.array(noise).mean()
+                snr.append(sig / noise)
+            return np.array(snr)
+
+        snr = compsnr(f, _Pxx)
+        snr = snr[:20]  # For frequenceies below 20.0 Hz
+        f = f[:20]      # For frequenceies below 20.0 Hz
+
+        ind = np.argpartition(snr, -4)[-4:]
+        Freqs = [f[i] for i in ind if f[i] > 4.0 and snr[i] > 1.5]
+        if len(self.recentFreqs) > self.recentfreqcount:
+            self.recentFreqs.pop(0)
+        self.recentFreqs.append(Freqs)
+
+    def _makedecisions(self):
+        """
+        Make decisions based on bci data
+        :return:
+        """
+        if len(self.recentFreqs) < 5:
+            return
+        self.detfreq['det'] = [0, 0, 0, 0]
+        for chk_i in range(len(self.detfreq['freq'])):
+            chkfreq = self.detfreq['freq'][chk_i]
+            for _det in self.recentFreqs:
+                for _f in _det:
+                    if abs(_f - chkfreq) < self.freqdetspread:
+                        self.detfreq['det'][chk_i] += 1
+        # Show Message or call appropriate Thing #
+        for chk_i in range(len(self.detfreq['freq'])):
+            if self.detfreq['det'][chk_i] >= self.freqdetcount:
+                if chk_i == 0:
+                    self._moveforward()
+                elif chk_i == 1:
+                    self._moveleft()
+                elif chk_i == 2:
+                    self._moveright()
+                elif chk_i == 3:
+                    self._stoprobotsig()
+                else:
+                    print 'Detected Unknown Signal %s' % str(self.detfreq['freq'][chk_i])
+
+    def _moveforward(self):
+        """
+        Move Robot Forward
+        :return:
+        """
+        self.ui.widget_up.sigHighlight.emit()
+        self.vel2send = (self.velforward, 0.0, rospy.Time.now())
+        rospy.loginfo('Detected : User want to move forward')
+
+    def _moveleft(self):
+        """
+        Move Robot Left
+        :return:
+        """
+        self.ui.widget_left.sigHighlight.emit()
+        self.vel2send = (0.0, self.velrotation, rospy.Time.now())
+        rospy.loginfo('Detected : User want to turn left')
+
+    def _moveright(self):
+        """
+        Move Robot Right
+        :return:
+        """
+        self.ui.widget_right.sigHighlight.emit()
+        self.vel2send = (0.0, -1.0 * self.velrotation, rospy.Time.now())
+        rospy.loginfo('Detected : User want to trun right')
+
+    def _stoprobotsig(self):
+        """
+        Stop Robot
+        :return:
+        """
+        self.ui.widget_down.sigHighlight.emit()
+        self.vel2send = (self.velbackward, 0.0, rospy.Time.now())
+        rospy.loginfo('Detected : User want to stop')
+
+    def _onclickstop(self):
+        """
+        Callback to user stop
+        :return:
+        """
+        self.operaterobot = False
+        self.statusBar().showMessage('Command Velocities are disabled')
+        self.pubvel(0.0, 0.0)
+
+    def _onclickstart(self):
+        """
+        Callback to user start
+        :return:
+        """
+        self.operaterobot = True
+        self.statusBar().showMessage('You are now operating robot')
+
+    ## Handle Image Callback and Draw ##
+
+    def _recv_new_image_raw(self, ros_data):
+        """
+        Callback to raw image from ros topic
+        :param ros_data:
+        :return:
+        """
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(ros_data, "bgr8")
+            if cv_image is not None:
+                self._sigImageReceived.emit(cv_image)
+        except CvBridgeError as e:
+            rospy.logwarn('Error converting image : %s', e)
+
+    def _recv_new_image_compressed(self, ros_data):
+        """
+        Callback to new image from ros topic
+        :param rosdata: Compressed Image
+        :return:
+        """
+        np_arr = np.fromstring(ros_data.data, np.uint8)
+        if cv2.__version__[0] == '2':
+            image_np = cv2.imdecode(np_arr, cv2.CV_LOAD_IMAGE_COLOR)
+        else:
+            image_np = cv2.imdecode(np_arr, cv2.IMREAD_COLOR) # OpenCV >= 3.0:
+        if image_np is not None:
+            self._sigImageReceived.emit(image_np)
+
+    def _cleardisplay(self):
+        """
+        Clears display
+        :return:
+        """
+        self.imgdisplayed = None
+        self.scene.clear()
+
+    def _gVideoResizeEvent(self, event):
+        """
+        Hooked function to update displayed image on resize
+        :param event:
+        :return:
+        """
+        if self.imgdisplayed is not None:
+            self._displayimage(self.imgdisplayed)
+        QtGui.QGraphicsView.resizeEvent(self.ui.camView, event)
+
+    @QtCore.pyqtSlot(np.ndarray)
+    def _displayimage(self, _img):
+        """
+        Display Image
+        :param _img:
+        :return:
+        """
+        _image = cv2.cvtColor(_img, cv2.COLOR_BGR2RGB)
+        _height, _width = _image.shape[:2]
+        if _height > 0 and _width > 0:
+            self.imgdisplayed = None
+            self.scene.clear()
+            _frame = QtGui.QImage(_image.data, _width, _height, QtGui.QImage.Format_RGB888)
+            self.scene.addPixmap(QtGui.QPixmap.fromImage(_frame).scaled(self.ui.camView.size()))
+            self.scene.update()
+            self.ui.camView.setScene(self.scene)
+            self.imgdisplayed = _img
+
+    ## Change Image and Command Velocity ##
+
+    def _onreloadcam(self):
+        """
+        Search ROS graph for subscribe-able image feed
+        :return:
+        """
+        self.ui.tbReloadCamera.setEnabled(False)
+        _allndoes = rosnode.get_node_names()
+        _camtopics = []
+        _camtypes = []
+        for _nname in _allndoes:
+            _pubs, _, _ = GaitechBCITeleopMainWindow.__getpubsubsrv(_nname)
+            for _pub in _pubs:
+                _parts = _pub.split()
+                if len(_parts) < 3:
+                    continue
+                if _parts[0] != '*':
+                    continue
+                _topictype, _, _ = rostopic.get_topic_type(_parts[1])
+                if _topictype == 'sensor_msgs/Image':
+                    # Include only those that have compressed messages #
+                    _topictype, _, _ = rostopic.get_topic_type('%s/compressed'%_parts[1])
+                    if _topictype == 'sensor_msgs/CompressedImage':
+                        _camtopics.append(_parts[1])
+                        _camtypes.append('compressed')
+                    else:
+                        _camtopics.append(_parts[1])
+                        _camtypes.append('raw')
+        # Scan nodes complete Update UI Now #
+        self._update_image_scan(_camtopics, _camtypes)
+        self.ui.tbReloadCamera.setEnabled(True)
+
+    def _update_image_scan(self, _topics, _topictypes):
+        """
+        Update Results of image topics scan
+        :param _topics:
+        :return:
+        """
+        self.allcamtopics = _topics
+        self.allcamtopicstype = _topictypes
+        if len(self.allcamtopics) > 0:
+            self.__updatingcamtopics = True
+            self.ui.cbCamera.clear()
+            for _nname in self.allcamtopics:
+                self.ui.cbCamera.addItem(_nname)
+            self.__updatingcamtopics = False
+
+            # Set Old Item if possible
+            if self.activecamtopic is not None:
+                _posidx = self.ui.cbCamera.findText(self.activecamtopic)
+                if _posidx != -1:
+                    self.ui.cbCamera.setCurrentIndex(_posidx)
+                else:
+                    self.ui.cbCamera.setCurrentIndex(0)
+            else:
+                self.ui.cbCamera.setCurrentIndex(0)
+            self._imagesubchanged()
+            self.ui.cbCamera.setEnabled(True)
+            self.ui.cbCamera.setToolTip('Select camera feed topic')
+        else:
+            self.ui.cbCamera.setToolTip('No image topic found')
+            self.__updatingcamtopics = True
+            self.ui.cbCamera.setEnabled(False)
+            self.ui.cbCamera.clear()
+            self.activecamtopic = None
+            self.__updatingcamtopics = False
+            if self.camsub is not None:
+                rospy.loginfo('Unregistering topic %s', self.camsub.name)
+                self.camsub.unregister()
+                self.camsub = None
+                self._cleardisplay()
+
+    def _imagesubchanged(self):
+        """
+        Subscribed image changed by user action
+        :return:
+        """
+        if self.__updatingcamtopics:
+            return
+        if self.ui.cbCamera.currentIndex() != -1:
+            if self.activecamtopic is None or \
+                    (self.activecamtopic is not None and self.activecamtopic != str(self.ui.cbCamera.currentText())):
+                if self.camsub is not None:
+                    rospy.loginfo('Unregistering topic %s', self.camsub.name)
+                    self.camsub.unregister()
+                    self.camsub = None
+                ### Current Topic changed ###
+                self.activecamtopic = str(self.ui.cbCamera.currentText())
+                _toptype = None
+                for _i in range(len(self.allcamtopicstype)):
+                    if self.allcamtopics[_i] == self.activecamtopic:
+                        _toptype = self.allcamtopicstype[_i]
+                        break
+                ### Connect Publisher etc ###
+                if _toptype == 'compressed':
+                    self.camsub = rospy.Subscriber('%s/compressed'%self.activecamtopic, CompressedImage,
+                                                   self._recv_new_image_compressed, queue_size = 1)
+                elif _toptype == 'raw':
+                    self.camsub = rospy.Subscriber(self.activecamtopic, Image, self._recv_new_image_raw, queue_size=1)
+                if self.camsub is not None:
+                    rospy.loginfo('Subscribed topic %s [%s]', self.camsub.name, self.camsub.type)
+                else:
+                    rospy.logwarn('Cannot subscribe to %s, Unknown Type', self.camsub.name)
+                self._cleardisplay()
+
+    def _onereloadcvel(self):
+        """
+        Search ROS graph for publish-able command velocity
+        :return:
+        """
+        self.ui.tbReloadCVel.setEnabled(False)
+        _allndoes = rosnode.get_node_names()
+        _cveltopics = []
+        for _nname in _allndoes:
+            _, _subs, _ = GaitechBCITeleopMainWindow.__getpubsubsrv(_nname)
+            for _sub in _subs:
+                _parts = _sub.split()
+                if len(_parts) < 3:
+                    continue
+                if _parts[0] != '*':
+                    continue
+                _topictype, _ , _ = rostopic.get_topic_type(_parts[1])
+                if _topictype == 'geometry_msgs/Twist':
+                    _cveltopics.append(_parts[1])
+        # Scan nodes complete Update UI Now #
+        self._update_cvel_scan(_cveltopics)
+        self.ui.tbReloadCVel.setEnabled(True)
+
+    def _update_cvel_scan(self, _topics):
+        """
+        Update Results of command velocity topic scan
+        :return:
+        """
+        self.allcveltopics = _topics
+        if len(self.allcveltopics) > 0:
+            self.__updatingcveltopics = True
+            self.ui.cvCVel.clear()
+            for _nname in self.allcveltopics:
+                self.ui.cvCVel.addItem(_nname)
+            self.__updatingcveltopics = False
+
+            # Set Old Item if possible
+            if self.activecveltopic is not None:
+                _posidx = self.ui.cvCVel.findText(self.activecveltopic)
+                if _posidx != -1:
+                    self.ui.cvCVel.setCurrentIndex(_posidx)
+                else:
+                    self.ui.cvCVel.setCurrentIndex(0)
+            else:
+                self.ui.cvCVel.setCurrentIndex(0)
+            self._commandvelchanged()
+            self.ui.cvCVel.setEnabled(True)
+            self.ui.cvCVel.setToolTip('Select command velocity topic')
+        else:
+            self.ui.cvCVel.setToolTip('No command velocity topic found')
+            self.__updatingcveltopics = True
+            self.ui.cvCVel.setEnabled(False)
+            self.ui.cvCVel.clear()
+            self.activecveltopic = None
+            self.__updatingcveltopics = False
+            if self.cvelpub is not None:
+                rospy.loginfo('Unregistering topic %s', self.cvelpub.name)
+                self.cvelpub.unregister()
+                self.cvelpub = None
+
+    def _commandvelchanged(self):
+        """
+        User changed active command velocity
+        :return:
+        """
+        if self.__updatingcveltopics:
+            return
+        if self.ui.cvCVel.currentIndex() != -1:
+            if self.activecveltopic is None or \
+                    (self.activecveltopic is not None and self.activecveltopic != str(self.ui.cvCVel.currentText())):
+                if self.cvelpub is not None:
+                    rospy.loginfo('Unregistering topic %s', self.cvelpub.name)
+                    self.cvelpub.unregister()
+                    self.cvelpub = None
+                ### Current Topic changed ###
+                self.activecveltopic = str(self.ui.cvCVel.currentText())
+                ### Connect Publisher etc ###
+                self.cvelpub = rospy.Publisher(self.activecveltopic, Twist, queue_size=5)
+                rospy.loginfo('Will publish %s on topic %s', self.cvelpub.type, self.cvelpub.name)
+
+    ## Callbacks for settings change ##
+    def _flickerinit(self):
+        """
+        Stop Value Changed
+        :return:
+        """
+        self._changeBgs()
+        self._changeFgUp()
+        self._changeFgDown()
+        self._changeFgLeft()
+        self._changeFgRight()
+        self._freq1change(None)
+        self._freq2change(None)
+        self._freq3change(None)
+        self._freq4change(None)
+
+    def _freq1change(self, _newval):
+        self.ui.widget_left.setFrequency(self.ui.spfLeft.value())
+        self.detfreq['freq'][1] = self.ui.spfLeft.value()
+        self.detfreq['det'][1] = 0
+
+    def _freq2change(self, _newval):
+        self.ui.widget_right.setFrequency(self.ui.spfRight.value())
+        self.detfreq['freq'][2] = self.ui.spfRight.value()
+        self.detfreq['det'][2] = 0
+
+    def _freq3change(self, _newval):
+        self.ui.widget_up.setFrequency(self.ui.spfUp.value())
+        self.detfreq['freq'][0] = self.ui.spfUp.value()
+        self.detfreq['det'][0] = 0
+
+    def _freq4change(self, _newval):
+        self.ui.widget_down.setFrequency(self.ui.spfStop.value())
+        self.detfreq['freq'][3] = self.ui.spfStop.value()
+        self.detfreq['det'][3] = 0
+
+    def _changeBgs(self):
+        """
+        Set Backgrounds according to color values
+        :return:
+        """
+        def _selection2clr(_name):
+            _sel = _name.lower()
+            return _sel
+
+        _lft = _selection2clr(str(self.ui.cbBgLeft.currentText()))
+        _right = _selection2clr(str(self.ui.cbBgRight.currentText()))
+        _up = _selection2clr(str(self.ui.cbBgUp.currentText()))
+        _down = _selection2clr(str(self.ui.cbBgStop.currentText()))
+        self.ui.widget_down.changeBackground(_down)
+        self.ui.widget_up.changeBackground(_up)
+        self.ui.widget_left.changeBackground(_lft)
+        self.ui.widget_right.changeBackground(_right)
+
+    def _txt2clr(self, _txt):
+        """
+        convert value from combo box to color
+        :param _txt:
+        :return:
+        """
+        _clr = str(_txt).lower()
+        if _clr == 'white':
+            return None
+        if _clr == 'black':
+            return QtCore.Qt.black
+        if _clr == 'red':
+            return QtCore.Qt.red
+        if _clr == 'dark red':
+            return QtCore.Qt.darkRed
+        if _clr == 'green':
+            return QtCore.Qt.green
+        if _clr == 'dark green':
+            return QtCore.Qt.darkGreen
+        if _clr == 'blue':
+            return QtCore.Qt.blue
+        if _clr == 'dark blue':
+            return QtCore.Qt.darkBlue
+        if _clr == 'cyan':
+            return QtCore.Qt.cyan
+        if _clr == 'dark cyan':
+            return QtCore.Qt.darkCyan
+        if _clr == 'yellow':
+            return QtCore.Qt.yellow
+        if _clr == 'dark yellow':
+            return QtCore.Qt.darkYellow
+        if _clr == 'magenta':
+            return QtCore.Qt.magenta
+        if _clr == 'dark magenta':
+            return QtCore.Qt.darkMagenta
+        return None
+
+    def _changeFgUp(self):
+        """
+        Callback to fg change
+        :return:
+        """
+        _clr = self._txt2clr(self.ui.cbUp.currentText())
+        self.ui.widget_up.setImage(ImageUp, _clr)
+        self.ui.widget_up.start()   # Because it was stopped earlier
+
+    def _changeFgLeft(self):
+        """
+        Callback to fg change
+        :return:
+        """
+        _clr = self._txt2clr(self.ui.cbLeft.currentText())
+        self.ui.widget_left.setImage(ImageLeft, _clr)
+        self.ui.widget_left.start()  # Because it was stopped earlier
+
+    def _changeFgRight(self):
+        """
+        Callback to fg change
+        :return:
+        """
+        _clr = self._txt2clr(self.ui.cbRight.currentText())
+        self.ui.widget_right.setImage(ImageRight, _clr)
+        self.ui.widget_right.start()  # Because it was stopped earlier
+
+    def _changeFgDown(self):
+        """
+        Callback to fg change
+        :return:
+        """
+        _clr = self._txt2clr(self.ui.cbStop.currentText())
+        self.ui.widget_down.setImage(ImageDown, _clr)
+        self.ui.widget_down.start()  # Because it was stopped earlier
+
+    ## Initailize Things ##
+    def _connectcallbacks(self):
+        """
+        Connect callbacks to UI elements
+        :return:
+        """
+        self.ui.action_About.triggered.connect(self._on_about)
+        self.ui.action_How_to.triggered.connect(self._on_show_help)
+        self.ui.actionE_xit.triggered.connect(self._on_exit)
+        self.ui.spfLeft.valueChanged.connect(self._freq1change)
+        self.ui.spfRight.valueChanged.connect(self._freq2change)
+        self.ui.spfUp.valueChanged.connect(self._freq3change)
+        self.ui.spfStop.valueChanged.connect(self._freq4change)
+        self.ui.cbBgLeft.currentIndexChanged.connect(self._changeBgs)
+        self.ui.cbBgRight.currentIndexChanged.connect(self._changeBgs)
+        self.ui.cbBgUp.currentIndexChanged.connect(self._changeBgs)
+        self.ui.cbBgStop.currentIndexChanged.connect(self._changeBgs)
+        self.ui.cbUp.currentIndexChanged.connect(self._changeFgUp)
+        self.ui.cbLeft.currentIndexChanged.connect(self._changeFgLeft)
+        self.ui.cbRight.currentIndexChanged.connect(self._changeFgRight)
+        self.ui.cbStop.currentIndexChanged.connect(self._changeFgDown)
+        self.ui.tbReloadCamera.clicked.connect(self._onreloadcam)
+        self.ui.tbReloadCVel.clicked.connect(self._onereloadcvel)
+        self.ui.cvCVel.currentIndexChanged.connect(self._commandvelchanged)
+        self.ui.cbCamera.currentIndexChanged.connect(self._imagesubchanged)
+        self.ui.camView.resizeEvent = self._gVideoResizeEvent  # Hook resize event
+        self._sigImageReceived.connect(self._displayimage)
+        self.ui.btnStop.clicked.connect(self._onclickstop)
+        self.ui.btnStart.clicked.connect(self._onclickstart)
+
+    def _initialize_ui(self):
+        """
+        Initialize Icons etc.
+        :return:
+        """
+        try:
+            self.setWindowIcon(QtGui.QIcon(os.path.join(resource_dir, 'gaitech_logo.png')))
+        except:
+            print 'Debugging: Unable to load gaitech icon'
+        try:
+            self.ui.tbReloadCamera.setIcon(QtGui.QIcon(os.path.join(resource_dir, 'if_sync-01_186384.png')))
+        except:
+            print 'Debugging: Unable to load sync icon'
+        try:
+            self.ui.tbReloadCVel.setIcon(QtGui.QIcon(os.path.join(resource_dir, 'if_sync-01_186384.png')))
+        except:
+            print 'Debugging: Unable to load sync icon'
+
+    def closethreads(self):
+        """
+        Close running threads
+        :return:
+        """
+        self.ui.widget_right.stop()
+        self.ui.widget_left.stop()
+        self.ui.widget_down.stop()
+        self.ui.widget_up.stop()
+
+    @staticmethod
+    def __getpubsubsrv(_nodename):
+        """
+        Get Pub, Subs and Srvs of ROS Node
+        :param _nodename:
+        :return:
+        """
+        try:
+            _desc = rosnode.get_node_info_description(_nodename)
+        except:
+            _desc = ''
+        _publines = []
+        _sublines = []
+        _serlines = []
+        _swtch = 0
+        for _line in _desc.splitlines():
+            if len(_line) > 0:
+                if 'Publications' in _line:
+                    _swtch = 1
+                elif 'Subscriptions' in _line:
+                    _swtch = 2
+                elif 'Services' in _line:
+                    _swtch = 3
+                else:
+                    if _swtch == 1:
+                        _publines.append(str(_line))
+                    elif _swtch == 2:
+                        _sublines.append(str(_line))
+                    elif _swtch == 3:
+                        _serlines.append(str(_line))
+        return _publines, _sublines, _serlines
+
+    def get_param(self, name, value=None):
+        """
+        Get parameter from ROS parameter server
+        :param name:
+        :param value:
+        :return:
+        """
+        private = "~%s" % name
+        if rospy.has_param(private):
+            print 'has param'
+            return rospy.get_param(private)
+        elif rospy.has_param(name):
+            return rospy.get_param(name)
+        else:
+            return value
+
+
+if __name__ == '__main__':
+    try:
+        rospy.init_node('bci_teleop')
+        rospy.loginfo('Starting bci_teleop')
+        app = QtGui.QApplication(sys.argv)
+        gui = GaitechBCITeleopMainWindow()
+        gui.show()
+        Thread(target=gui.loop).start()
+        pysignal.signal(pysignal.SIGINT, pysignal.SIG_DFL)
+        app.exec_()
+        # Cleanup #
+        rospy.loginfo('Exiting')
+        gui.closethreads()
+        rospy.loginfo('Threads Closed')
+    except rospy.ROSInterruptException:
+        pass
