@@ -15,7 +15,7 @@ $ catkin_make
 
 2. Clone gaitech_bci repository in gaitech_bci_ws/src and catkin_make the workspace
 $ cd ~/gaitech_bci_ws/src
-$ git clone https://alibwahid@bitbucket.org/alibwahid/gaitech_bci.git
+$ git clone https://github.com/gaitech-robotics/gaitech-bci.git
 $ cd ../
 $ catkin_make
 
